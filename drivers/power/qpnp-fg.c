@@ -13,7 +13,9 @@
 #define pr_fmt(fmt)	"FG: %s: " fmt, __func__
 
 #include <linux/atomic.h>
+#include <linux/crc32.h>
 #include <linux/delay.h>
+#include <linux/firmware.h>
 #include <linux/kernel.h>
 #include <linux/of.h>
 #include <linux/rtc.h>
@@ -30,11 +32,13 @@
 #include <linux/module.h>
 #include <linux/ktime.h>
 #include <linux/power_supply.h>
+#include <linux/qpnp/qpnp-adc.h>
 #include <linux/of_batterydata.h>
 #include <linux/spinlock.h>
 #include <linux/string_helpers.h>
 #include <linux/alarmtimer.h>
 #include <linux/qpnp/qpnp-revid.h>
+#include <linux/qpnp-fg.h>
 
 /* Register offsets */
 
@@ -72,7 +76,7 @@
 #define QPNP_FG_DEV_NAME "qcom,qpnp-fg"
 #define MEM_IF_TIMEOUT_MS	5000
 #define FG_CYCLE_MS		1500
-#define BUCKET_COUNT		8
+#define BUCKET_COUNT		QPNP_FG_BUCKET_COUNT
 #define BUCKET_SOC_PCT		(256 / BUCKET_COUNT)
 
 #define BCL_MA_TO_ADC(_current, _adc_val) {		\
@@ -218,8 +222,12 @@ enum fg_mem_data_index {
 	FG_DATA_CURRENT,
 	FG_DATA_BATT_ESR,
 	FG_DATA_BATT_ESR_COUNT,
+	FG_DATA_RSLOW,
+	FG_DATA_CUTOFF_SOC,
 	FG_DATA_BATT_SOC,
 	FG_DATA_CC_CHARGE,
+	FG_DATA_SYSTEM_SOC,
+	FG_DATA_MONOTONIC_SOC,
 	FG_DATA_VINT_ERR,
 	FG_DATA_CPRED_VOLTAGE,
 	/* values below this only gets read once per profile reload */
@@ -270,8 +278,12 @@ static struct fg_mem_data fg_data[FG_DATA_MAX] = {
 	DATA(CURRENT,         0x5CC,   3,      2,     -EINVAL),
 	DATA(BATT_ESR,        0x554,   2,      2,     -EINVAL),
 	DATA(BATT_ESR_COUNT,  0x558,   2,      2,     -EINVAL),
+	DATA(RSLOW,           0x558,   0,      2,     -EINVAL),
+	DATA(CUTOFF_SOC,      0x564,   0,      3,     -EINVAL),
 	DATA(BATT_SOC,        0x56C,   1,      3,     -EINVAL),
 	DATA(CC_CHARGE,       0x570,   0,      4,     -EINVAL),
+	DATA(SYSTEM_SOC,      0x574,   0,      2,     -EINVAL),
+	DATA(MONOTONIC_SOC,   0x574,   2,      2,     -EINVAL),
 	DATA(VINT_ERR,        0x560,   0,      4,     -EINVAL),
 	DATA(CPRED_VOLTAGE,   0x540,   0,      2,     -EINVAL),
 	DATA(BATT_ID,         0x594,   1,      1,     -EINVAL),
@@ -638,6 +650,8 @@ struct fg_chip {
 	bool			batt_info_restore;
 	bool			*batt_range_ocv;
 	int			*batt_range_pct;
+	/* Battery cycle count */
+	int			fake_battery_cycle_count;
 };
 
 /* FG_MEMIF DEBUGFS structures */
@@ -2529,6 +2543,9 @@ static int update_sram_data(struct fg_chip *chip, int *resched_ms)
 		case FG_DATA_BATT_ESR_COUNT:
 			fg_data[i].value = (u16)temp;
 			break;
+		case FG_DATA_RSLOW:
+			fg_data[i].value = float_decode((u16) temp);
+			break;
 		case FG_DATA_BATT_ID:
 			if (battid_valid)
 				fg_data[i].value = reg[0] * LSB_8B;
@@ -2536,6 +2553,9 @@ static int update_sram_data(struct fg_chip *chip, int *resched_ms)
 		case FG_DATA_BATT_ID_INFO:
 			if (battid_valid)
 				fg_data[i].value = reg[0];
+			break;
+		case FG_DATA_CUTOFF_SOC:
+			fg_data[i].value = (u32)temp;
 			break;
 		case FG_DATA_BATT_SOC:
 			fg_data[i].value = div64_s64((temp * 10000),
@@ -2546,6 +2566,12 @@ static int update_sram_data(struct fg_chip *chip, int *resched_ms)
 			fg_data[i].value = div64_s64(
 					temp * (int64_t)chip->nom_cap_uah,
 					FULL_PERCENT_28BIT);
+			break;
+		case FG_DATA_MONOTONIC_SOC:
+			fg_data[i].value = (u16)temp;
+			break;
+		case FG_DATA_SYSTEM_SOC:
+			fg_data[i].value = (u16)temp;
 			break;
 		case FG_DATA_VINT_ERR:
 			temp = twos_compliment_extend(temp, fg_data[i].len);
@@ -2682,6 +2708,8 @@ out:
 			msecs_to_jiffies(resched_ms));
 }
 
+static bool is_charger_available(struct fg_chip *chip);
+
 #define BATT_TEMP_OFFSET	3
 #define BATT_TEMP_CNTRL_MASK	0x17
 #define DISABLE_THERM_BIT	BIT(0)
@@ -2704,7 +2732,6 @@ static void update_temp_data(struct work_struct *work)
 	struct fg_chip *chip = container_of(work,
 				struct fg_chip,
 				update_temp_work.work);
-
 	if (chip->fg_restarting)
 		goto resched;
 
@@ -2757,6 +2784,9 @@ wait:
 			temp < chip->batt_temp_high_limit) {
 		chip->last_good_temp = temp;
 		fg_data[0].value = temp;
+
+		if (is_charger_available(chip))
+			power_supply_changed(chip->batt_psy);
 	} else {
 		fg_data[0].value = chip->last_good_temp;
 
@@ -2853,6 +2883,29 @@ static void restore_cycle_counter(struct fg_chip *chip)
 				i, rc);
 		else
 			chip->cyc_ctr.count[i] = data[0] | data[1] << 8;
+	}
+	fg_mem_release(chip);
+}
+
+static void restore_cycle_counter_sram(struct fg_chip *chip,
+		struct fg_cycle_counts *counts)
+{
+	int i, rc, address;
+
+	if (!chip->cyc_ctr.en)
+		return;
+
+	fg_mem_lock(chip);
+	for (i = 0; i < BUCKET_COUNT; i++) {
+		pr_debug("BATT_CYCLE_NUMBER[%d] = 0x%04x\n",
+				i, counts->buckets[i].count);
+		address = BATT_CYCLE_NUMBER_REG + counts->buckets[i].id * 2;
+		rc = fg_mem_write(chip, (u8 *)&counts->buckets[i].count,
+				address, sizeof(u16),
+				BATT_CYCLE_OFFSET, 0);
+		if (rc)
+			pr_err("Failed to write BATT_CYCLE_NUMBER[%d] rc: %d\n",
+				i, rc);
 	}
 	fg_mem_release(chip);
 }
@@ -2964,6 +3017,58 @@ out:
 	mutex_unlock(&chip->cyc_ctr.lock);
 }
 
+#define CYCLE_STATS_FILE "cycle_stats.bin"
+static int load_cycle_counter(struct fg_chip *chip)
+{
+	int rc = 0;
+	u32 crc;
+	const struct firmware *fw = NULL;
+	struct fg_cycle_counts *counts = NULL;
+
+	mutex_lock(&chip->cyc_ctr.lock);
+
+	rc = request_firmware(&fw, CYCLE_STATS_FILE, chip->dev);
+	if (rc) {
+		pr_err("%s: failed to load %s\n", __func__, CYCLE_STATS_FILE);
+		goto out;
+	}
+
+	counts = (struct fg_cycle_counts *)fw->data;
+	if (counts->magic != QPNP_FG_CYCLE_COUNTS_MAGIC) {
+		rc = -EINVAL;
+		pr_err("%s: %s: invalid magic\n", __func__, CYCLE_STATS_FILE);
+		goto out;
+	}
+
+	if (counts->bucket_count != BUCKET_COUNT) {
+		rc = -EINVAL;
+		pr_err("%s: invalid bucket count: %d\n",
+			__func__, counts->bucket_count);
+		goto out;
+	}
+
+	/*
+	 * Linux crc32 expects pre/post (crc ^ 0xffffffff) step
+	 * to be performed by caller
+	 */
+	crc = crc32(~0, (const unsigned char*) counts,
+			sizeof(struct fg_cycle_counts) - 4) ^ ~0;
+	if (counts->crc32 != crc) {
+		rc = -EINVAL;
+		pr_err("%s: invalid checksum: 0x%08x, expected: 0x%08x\n",
+			__func__, crc, counts->crc32);
+		goto out;
+	}
+
+	restore_cycle_counter_sram(chip, counts);
+	restore_cycle_counter(chip);
+
+out:
+	release_firmware(fw);
+	mutex_unlock(&chip->cyc_ctr.lock);
+	return rc;
+}
+
 static int fg_get_cycle_count(struct fg_chip *chip)
 {
 	int count;
@@ -2978,6 +3083,22 @@ static int fg_get_cycle_count(struct fg_chip *chip)
 	count = chip->cyc_ctr.count[chip->cyc_ctr.id - 1];
 	mutex_unlock(&chip->cyc_ctr.lock);
 	return count;
+}
+
+static int fg_get_aggregate_cycle_count(struct fg_chip *chip)
+{
+	int i;
+	int count = 0;
+
+	if (!chip->cyc_ctr.en)
+		return 0;
+
+	mutex_lock(&chip->cyc_ctr.lock);
+	for (i = 0; i < BUCKET_COUNT; i++)
+		count += chip->cyc_ctr.count[i];
+	mutex_unlock(&chip->cyc_ctr.lock);
+
+	return count / BUCKET_COUNT;
 }
 
 static void half_float_to_buffer(int64_t uval, u8 *buffer)
@@ -3164,9 +3285,7 @@ static int estimate_battery_age(struct fg_chip *chip, int *actual_capacity)
 	}
 
 	battery_soc = get_battery_soc_raw(chip) * 100 / FULL_PERCENT_3B;
-	if (rc) {
-		goto error_done;
-	} else if (battery_soc < 25 || battery_soc > 75) {
+	if (battery_soc < 25 || battery_soc > 75) {
 		if (fg_debug_mask & FG_AGING)
 			pr_info("Battery SoC (%d) out of range, aborting\n",
 					(int)battery_soc);
@@ -4451,12 +4570,21 @@ static enum power_supply_property fg_power_props[] = {
 	POWER_SUPPLY_PROP_VOLTAGE_MIN,
 	POWER_SUPPLY_PROP_CYCLE_COUNT,
 	POWER_SUPPLY_PROP_CYCLE_COUNT_ID,
+	POWER_SUPPLY_PROP_FAKE_AGGREGATE_CYCLE_COUNT,
+	POWER_SUPPLY_PROP_AGGREGATE_CYCLE_COUNT,
 	POWER_SUPPLY_PROP_HI_POWER,
 	POWER_SUPPLY_PROP_SOC_REPORTING_READY,
 	POWER_SUPPLY_PROP_IGNORE_FALSE_NEGATIVE_ISENSE,
 	POWER_SUPPLY_PROP_ENABLE_JEITA_DETECTION,
 	POWER_SUPPLY_PROP_BATTERY_INFO,
 	POWER_SUPPLY_PROP_BATTERY_INFO_ID,
+	POWER_SUPPLY_PROP_CHARGE_BATTERY,
+	POWER_SUPPLY_PROP_CHARGE_CUTOFF,
+	POWER_SUPPLY_PROP_CHARGE_MONOTONIC,
+	POWER_SUPPLY_PROP_CHARGE_SYSTEM,
+	POWER_SUPPLY_PROP_RESISTANCE_SLOW,
+	POWER_SUPPLY_PROP_VOLTAGE_PREDICTED,
+	POWER_SUPPLY_PROP_CALIBRATE,
 };
 
 static int fg_power_get_property(struct power_supply *psy,
@@ -4517,6 +4645,15 @@ static int fg_power_get_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_CYCLE_COUNT_ID:
 		val->intval = chip->cyc_ctr.id;
 		break;
+	case POWER_SUPPLY_PROP_FAKE_AGGREGATE_CYCLE_COUNT:
+		val->intval = chip->fake_battery_cycle_count;
+		break;
+	case POWER_SUPPLY_PROP_AGGREGATE_CYCLE_COUNT:
+		if (chip->fake_battery_cycle_count >= 0)
+			val->intval = chip->fake_battery_cycle_count;
+		else
+			val->intval = fg_get_aggregate_cycle_count(chip);
+		break;
 	case POWER_SUPPLY_PROP_RESISTANCE_ID:
 		val->intval = get_sram_prop_now(chip, FG_DATA_BATT_ID);
 		break;
@@ -4561,6 +4698,27 @@ static int fg_power_get_property(struct power_supply *psy,
 		break;
 	case POWER_SUPPLY_PROP_BATTERY_INFO_ID:
 		val->intval = chip->batt_info_id;
+		break;
+	case POWER_SUPPLY_PROP_CHARGE_BATTERY:
+		val->intval = get_sram_prop_now(chip, FG_DATA_BATT_SOC);
+		break;
+	case POWER_SUPPLY_PROP_CHARGE_CUTOFF:
+		val->intval = get_sram_prop_now(chip, FG_DATA_CUTOFF_SOC);
+		break;
+	case POWER_SUPPLY_PROP_CHARGE_MONOTONIC:
+		val->intval = get_sram_prop_now(chip, FG_DATA_MONOTONIC_SOC);
+		break;
+	case POWER_SUPPLY_PROP_CHARGE_SYSTEM:
+		val->intval = get_sram_prop_now(chip, FG_DATA_SYSTEM_SOC);
+		break;
+	case POWER_SUPPLY_PROP_RESISTANCE_SLOW:
+		val->intval = get_sram_prop_now(chip, FG_DATA_RSLOW);
+		break;
+	case POWER_SUPPLY_PROP_VOLTAGE_PREDICTED:
+		val->intval = get_sram_prop_now(chip, FG_DATA_CPRED_VOLTAGE);
+		break;
+	case POWER_SUPPLY_PROP_CALIBRATE:
+		val->intval = 0;
 		break;
 	default:
 		return -EINVAL;
@@ -4696,6 +4854,12 @@ static int fg_power_set_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_BATTERY_INFO_ID:
 		chip->batt_info_id = val->intval;
 		break;
+	case POWER_SUPPLY_PROP_AGGREGATE_CYCLE_COUNT:
+		chip->fake_battery_cycle_count = val->intval;
+		break;
+	case POWER_SUPPLY_PROP_CALIBRATE:
+		rc = load_cycle_counter(chip);
+		break;
 	default:
 		return -EINVAL;
 	};
@@ -4712,6 +4876,8 @@ static int fg_property_is_writeable(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_CYCLE_COUNT_ID:
 	case POWER_SUPPLY_PROP_BATTERY_INFO:
 	case POWER_SUPPLY_PROP_BATTERY_INFO_ID:
+	case POWER_SUPPLY_PROP_AGGREGATE_CYCLE_COUNT:
+	case POWER_SUPPLY_PROP_CALIBRATE:
 		return 1;
 	default:
 		break;
@@ -5316,6 +5482,15 @@ static irqreturn_t fg_soc_irq_handler(int irq, void *_chip)
 		fg_stay_awake(&chip->esr_extract_wakeup_source);
 		schedule_work(&chip->esr_extract_config_work);
 	}
+
+	pr_debug("%s, capacity=%d, current=%d, status=%d, usb=%d, voltage=%d, batt_temp=%d, batt_id=%d\n",
+		 __func__, get_prop_capacity(chip),
+		 get_sram_prop_now(chip, FG_DATA_CURRENT),
+		 chip->status,
+		 is_usb_present(chip),
+		 get_sram_prop_now(chip, FG_DATA_VOLTAGE),
+		 get_sram_prop_now(chip, FG_DATA_BATT_TEMP),
+		 get_sram_prop_now(chip, FG_DATA_BATT_ID));
 
 	return IRQ_HANDLED;
 }
@@ -7734,11 +7909,54 @@ unlock_mutex:
 	return ret;
 }
 
+static int fg_memif_sram_dump_open(struct inode *inode, struct file *file)
+{
+	int rc = 0;
+	struct fg_trans *trans = NULL;
+
+	/*
+	 * SRAM dump is a wrapper of the fg_memif interface with pre-determined
+	 * address and length. Thus, use the 'data' debugfs node and initialize
+	 * the transaction object accordingly.
+	 */
+	rc = fg_memif_data_open(inode, file);
+	if (rc) {
+		pr_err("%s: fg_memif_data_open() failed, rc=%d\n",
+			__func__, rc);
+		return rc;
+	}
+
+	trans = file->private_data;
+	trans->addr = SRAM_DUMP_START;
+	trans->cnt = SRAM_DUMP_LEN;
+	trans->offset = trans->addr;
+
+	return 0;
+}
+
+static int fg_memif_sram_dump_close(struct inode *inode, struct file *file)
+{
+	return fg_memif_dfs_close(inode, file);
+}
+
+static ssize_t fg_memif_sram_dump_read(struct file *file, char __user *buf,
+	size_t count, loff_t *ppos)
+{
+	return fg_memif_dfs_reg_read(file, buf, count, ppos);
+}
+
 static const struct file_operations fg_memif_dfs_reg_fops = {
 	.open		= fg_memif_data_open,
 	.release	= fg_memif_dfs_close,
 	.read		= fg_memif_dfs_reg_read,
 	.write		= fg_memif_dfs_reg_write,
+};
+
+/* File operations for the sram_data sysfs node. */
+static const struct file_operations fg_memif_sram_data_fops = {
+	.open           = fg_memif_sram_dump_open,
+	.release        = fg_memif_sram_dump_close,
+	.read           = fg_memif_sram_dump_read,
 };
 
 /**
@@ -7830,6 +8048,13 @@ int fg_dfs_create(struct fg_chip *chip)
 		goto err_remove_fs;
 	}
 
+	file = debugfs_create_file("sram_dump", S_IRUSR, root, &dbgfs_data,
+		&fg_memif_sram_data_fops);
+	if (!file) {
+		pr_err("error creating 'sram_dump' entry\n");
+		goto err_remove_fs;
+	}
+
 	return 0;
 
 err_remove_fs:
@@ -7892,9 +8117,11 @@ static int bcl_trim_workaround(struct fg_chip *chip)
 #define IRQ_USE_VOLTAGE_HYST_BIT	BIT(0)
 #define EMPTY_FROM_VOLTAGE_BIT		BIT(1)
 #define EMPTY_FROM_SOC_BIT		BIT(2)
+#define DBG_DELTA_SOC_EVERY_CYCLE	BIT(3)
 #define EMPTY_SOC_IRQ_MASK		(IRQ_USE_VOLTAGE_HYST_BIT | \
 					EMPTY_FROM_SOC_BIT | \
-					EMPTY_FROM_VOLTAGE_BIT)
+					EMPTY_FROM_VOLTAGE_BIT | \
+					DBG_DELTA_SOC_EVERY_CYCLE)
 static int fg_common_hw_init(struct fg_chip *chip)
 {
 	int rc;
@@ -8024,7 +8251,7 @@ static int fg_common_hw_init(struct fg_chip *chip)
 			chip->rslow_comp.active ? "en" : "dis");
 
 	/*
-	 * Clear bits 0-2 in 0x4B3 and set them again to make empty_soc irq
+	 * Clear bits 0-3 in 0x4B3 and set them again to make empty_soc irq
 	 * trigger again.
 	 */
 	rc = fg_mem_masked_write(chip, FG_ALG_SYSCTL_1, EMPTY_SOC_IRQ_MASK,
@@ -8037,8 +8264,13 @@ static int fg_common_hw_init(struct fg_chip *chip)
 	/* Wait for a FG cycle before enabling empty soc irq configuration */
 	msleep(FG_CYCLE_MS);
 
+	/*
+	 * Explicitly disables a debug flag that asserts the SOC delta IRQ on
+	 * every fuel gauge cycle (1.47 seconds).
+	 */
 	rc = fg_mem_masked_write(chip, FG_ALG_SYSCTL_1, EMPTY_SOC_IRQ_MASK,
-			EMPTY_SOC_IRQ_MASK, ALERT_CFG_OFFSET);
+			EMPTY_SOC_IRQ_MASK & ~DBG_DELTA_SOC_EVERY_CYCLE,
+			ALERT_CFG_OFFSET);
 	if (rc) {
 		pr_err("failed to write to 0x4B3 rc=%d\n", rc);
 		return rc;
@@ -8412,7 +8644,6 @@ out:
 static int fg_setup_memif_offset(struct fg_chip *chip)
 {
 	int rc;
-	u8 dig_major;
 
 	rc = fg_read(chip, chip->revision, chip->mem_base + DIG_MINOR, 4);
 	if (rc) {
@@ -8430,7 +8661,7 @@ static int fg_setup_memif_offset(struct fg_chip *chip)
 		chip->ima_supported = true;
 		break;
 	default:
-		pr_err("Digital Major rev=%d not supported\n", dig_major);
+		pr_err("Digital Major rev=%d not supported\n", chip->revision[DIG_MAJOR]);
 		return -EINVAL;
 	}
 
@@ -8586,6 +8817,7 @@ static int fg_probe(struct spmi_device *spmi)
 	chip->spmi = spmi;
 	chip->dev = &(spmi->dev);
 
+	chip->fake_battery_cycle_count = -EINVAL;
 	wakeup_source_init(&chip->empty_check_wakeup_source.source,
 			"qpnp_fg_empty_check");
 	wakeup_source_init(&chip->memif_wakeup_source.source,

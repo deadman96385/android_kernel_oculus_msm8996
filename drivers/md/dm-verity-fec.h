@@ -28,10 +28,22 @@
 #define DM_VERITY_FEC_BUF_MAX \
 	(1 << (PAGE_SHIFT - DM_VERITY_FEC_BUF_RS_BITS))
 
+/* maximum recursion level for verity_fec_decode */
+#define DM_VERITY_FEC_MAX_RECURSION	4
+
 #define DM_VERITY_OPT_FEC_DEV		"use_fec_from_device"
 #define DM_VERITY_OPT_FEC_BLOCKS	"fec_blocks"
 #define DM_VERITY_OPT_FEC_START		"fec_start"
 #define DM_VERITY_OPT_FEC_ROOTS		"fec_roots"
+
+/*
+ * Max length of device name in major:minor format
+ * 4 = max length of major number (12 bit int)
+ * 7 = max length of minor number (20 bit int)
+ * 1 = colon separator
+ * 1 = EOS
+ */
+#define DM_VERITY_DEVNAME_SIZE		13
 
 /* configuration */
 struct dm_verity_fec {
@@ -61,6 +73,7 @@ struct dm_verity_fec_io {
 	unsigned nbufs;		/* number of buffers allocated */
 	u8 *output;		/* buffer for corrected output */
 	size_t output_pos;
+	unsigned level;		/* recursion level */
 };
 
 #ifdef CONFIG_DM_VERITY_FEC

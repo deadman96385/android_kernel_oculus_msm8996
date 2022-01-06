@@ -660,6 +660,7 @@ static void handle_sys_init_done(enum hal_command_response cmd, void *data)
 	struct msm_vidc_core *core;
 	struct vidc_hal_sys_init_done *sys_init_msg;
 	u32 index;
+	int i;
 
 	if (!IS_HAL_SYS_CMD(cmd)) {
 		dprintk(VIDC_ERR, "%s - invalid cmd\n", __func__);
@@ -704,6 +705,20 @@ static void handle_sys_init_done(enum hal_command_response cmd, void *data)
 	core->codec_count = sys_init_msg->codec_count;
 	memcpy(core->capabilities, sys_init_msg->capabilities,
 		sys_init_msg->codec_count * sizeof(struct msm_vidc_capability));
+
+	/* override decoder capabilities with max resolution supported by fw */
+	for (i = 0; i < VIDC_MAX_SESSIONS; i++) {
+		if (core->capabilities[i].domain == HAL_VIDEO_DOMAIN_DECODER) {
+			core->capabilities[i].width.max =
+				MAX_WIDTH_OVERRIDE_VALUE;
+			core->capabilities[i].height.max =
+				MAX_HEIGHT_OVERRIDE_VALUE;
+			core->capabilities[i].mbs_per_frame.max =
+				NUM_MBS_PER_FRAME(
+					core->capabilities[i].width.max,
+					core->capabilities[i].height.max/2);
+		}
+	}
 
 	dprintk(VIDC_DBG,
 		"%s: supported_codecs[%d]: enc = %#x, dec = %#x\n",
@@ -1063,11 +1078,11 @@ static void handle_event_change(enum hal_command_response cmd, void *data)
 	struct v4l2_event seq_changed_event = {0};
 	int rc = 0;
 	struct hfi_device *hdev;
-	u32 *ptr = NULL;
+	u32 *ptr;
 
 	if (!event_notify) {
 		dprintk(VIDC_WARN, "Got an empty event from hfi\n");
-		goto err_bad_event;
+		return;
 	}
 
 	inst = get_inst(get_vidc_core(event_notify->device_id),
@@ -2759,9 +2774,6 @@ static int msm_vidc_load_resources(int flipped_state,
 		dprintk(VIDC_ERR, "HW is overloaded, needed: %d max: %d\n",
 			num_mbs_per_sec, max_load_adj);
 		msm_vidc_print_running_insts(core);
-		inst->state = MSM_VIDC_CORE_INVALID;
-		msm_comm_kill_session(inst);
-		return -EBUSY;
 	}
 
 	hdev = core->device;
@@ -3658,7 +3670,7 @@ static int request_seq_header(struct msm_vidc_inst *inst,
  */
 int msm_comm_qbuf(struct msm_vidc_inst *inst, struct vb2_buffer *vb)
 {
-	int rc, capture_count, output_count;
+	int rc = 0, capture_count, output_count;
 	struct msm_vidc_core *core;
 	struct hfi_device *hdev;
 	struct {
@@ -3689,6 +3701,7 @@ int msm_comm_qbuf(struct msm_vidc_inst *inst, struct vb2_buffer *vb)
 		temp = kzalloc(sizeof(*temp), GFP_KERNEL);
 		if (!temp) {
 			dprintk(VIDC_ERR, "Out of memory\n");
+			rc = -ENOMEM;
 			goto err_no_mem;
 		}
 
@@ -3743,6 +3756,7 @@ int msm_comm_qbuf(struct msm_vidc_inst *inst, struct vb2_buffer *vb)
 
 		kfree(ftbs.data);
 		ftbs.data = NULL;
+		rc = -ENOMEM;
 		goto err_no_mem;
 	}
 
@@ -4755,7 +4769,6 @@ static int msm_vidc_load_supported(struct msm_vidc_inst *inst)
 				num_mbs_per_sec,
 				max_load_adj);
 			msm_vidc_print_running_insts(inst->core);
-			return -EBUSY;
 		}
 	}
 	return 0;

@@ -17,6 +17,7 @@
 #include <linux/iopoll.h>
 #include <linux/delay.h>
 #include <linux/clk/msm-clock-generic.h>
+#include <linux/string.h>
 
 #include "mdss-pll.h"
 #include "mdss-dsi-pll.h"
@@ -450,6 +451,7 @@ int vco_set_rate(struct dsi_pll_vco_clk *vco, unsigned long rate)
 	struct mdss_pll_resources *dsi_pll_res = vco->priv;
 	int rc = 0;
 
+	memset(&vco_calc, 0, sizeof(vco_calc));
 	rc = pll_28nm_vco_rate_calc(vco, &vco_calc, rate);
 	if (rc) {
 		pr_err("vco rate calculation failed\n");

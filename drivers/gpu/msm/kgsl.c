@@ -42,6 +42,7 @@
 #include "kgsl_sync.h"
 #include "kgsl_compat.h"
 #include "kgsl_pool.h"
+#include "kgsl_threadstats.h"
 
 #undef MODULE_PARAM_PREFIX
 #define MODULE_PARAM_PREFIX "kgsl."
@@ -449,6 +450,13 @@ static void kgsl_mem_entry_detach_process(struct kgsl_mem_entry *entry)
 	entry->priv = NULL;
 }
 
+static inline void
+kgsl_mem_entry_put_deferred(struct kgsl_mem_entry *entry)
+{
+	INIT_WORK(&entry->work, _deferred_put);
+	queue_work(kgsl_driver.dealloc_workqueue, &entry->work);
+}
+
 /**
  * kgsl_context_dump() - dump information about a draw context
  * @device: KGSL device that owns the context
@@ -509,6 +517,7 @@ int kgsl_context_init(struct kgsl_device_private *dev_priv,
 			struct kgsl_context *context)
 {
 	struct kgsl_device *device = dev_priv->device;
+	struct kgsl_process_private *proc_priv = dev_priv->process_priv;
 	char name[64];
 	int ret = 0, id;
 
@@ -541,13 +550,13 @@ int kgsl_context_init(struct kgsl_device_private *dev_priv,
 	 * the context is destroyed. This will also prevent the pagetable
 	 * from being destroyed
 	 */
-	if (!kgsl_process_private_get(dev_priv->process_priv)) {
+	if (!kgsl_process_private_get(proc_priv)) {
 		ret = -EBADF;
 		goto out;
 	}
 	context->device = dev_priv->device;
 	context->dev_priv = dev_priv;
-	context->proc_priv = dev_priv->process_priv;
+	context->proc_priv = proc_priv;
 	context->tid = task_pid_nr(current);
 
 	ret = kgsl_sync_timeline_create(context);
@@ -557,6 +566,13 @@ int kgsl_context_init(struct kgsl_device_private *dev_priv,
 	snprintf(name, sizeof(name), "context-%d", id);
 	kgsl_add_event_group(&context->events, context, name,
 		kgsl_readtimestamp, context);
+
+	INIT_LIST_HEAD(&context->node);
+	if (kgsl_context_high_priority(context)) {
+		write_lock(&proc_priv->context_list_lock);
+		list_add(&context->node, &proc_priv->context_list);
+		write_unlock(&proc_priv->context_list_lock);
+	}
 
 out:
 	if (ret) {
@@ -568,6 +584,34 @@ out:
 	return ret;
 }
 EXPORT_SYMBOL(kgsl_context_init);
+
+/**
+ * kgsl_should_defer_gpumem_free() - Check if kgsl_mem_entry deallocation
+ * should happen asynchronously.
+ * @process: the owning process
+ */
+static inline bool
+kgsl_should_defer_gpumem_free(struct kgsl_process_private *process)
+{
+	struct kgsl_context *ctx;
+	pid_t tid = task_pid_nr(current);
+	bool found = false;
+
+	/*
+	 * If the calling thread uses at least one high priority context, treat
+	 * it as latency sensitive and defer calls to kgsl_mem_entry_put().
+	 */
+	read_lock(&process->context_list_lock);
+	list_for_each_entry(ctx, &process->context_list, node) {
+		if (ctx->tid == tid) {
+			BUG_ON(!kgsl_context_high_priority(ctx));
+			found = true;
+			break;
+		}
+	}
+	read_unlock(&process->context_list_lock);
+	return found;
+}
 
 /**
  * kgsl_context_detach() - Release the "master" context reference
@@ -583,6 +627,7 @@ EXPORT_SYMBOL(kgsl_context_init);
 static void kgsl_context_detach(struct kgsl_context *context)
 {
 	struct kgsl_device *device;
+	struct kgsl_process_private *proc_priv = context->proc_priv;
 
 	if (context == NULL)
 		return;
@@ -610,6 +655,10 @@ static void kgsl_context_detach(struct kgsl_context *context)
 
 	/* Remove the event group from the list */
 	kgsl_del_event_group(&context->events);
+
+	write_lock(&proc_priv->context_list_lock);
+	list_del(&context->node);
+	write_unlock(&proc_priv->context_list_lock);
 
 	kgsl_context_put(context);
 }
@@ -647,7 +696,9 @@ kgsl_context_destroy(struct kref *kref)
 		context->id = KGSL_CONTEXT_INVALID;
 	}
 	write_unlock(&device->context_lock);
+
 	kgsl_sync_timeline_destroy(context);
+	kgsl_thread_private_close(context->thread_priv);
 	kgsl_process_private_put(context->proc_priv);
 
 	device->ftbl->drawctxt_destroy(context);
@@ -890,6 +941,9 @@ static struct kgsl_process_private *kgsl_process_private_new(
 
 	idr_init(&private->mem_idr);
 	idr_init(&private->syncsource_idr);
+
+	INIT_LIST_HEAD(&private->context_list);
+	rwlock_init(&private->context_list_lock);
 
 	/* Allocate a pagetable for the new process object */
 	private->pagetable = kgsl_mmu_getpagetable(&device->mmu,
@@ -1247,7 +1301,8 @@ kgsl_sharedmem_find_id(struct kgsl_process_private *process, unsigned int id)
 	int result;
 	struct kgsl_mem_entry *entry;
 
-	drain_workqueue(kgsl_driver.mem_workqueue);
+	if (!kgsl_should_defer_gpumem_free(process))
+		drain_workqueue(kgsl_driver.mem_workqueue);
 
 	spin_lock(&process->mem_lock);
 	entry = idr_find(&process->mem_idr, id);
@@ -1681,6 +1736,12 @@ long kgsl_ioctl_drawctxt_create(struct kgsl_device_private *dev_priv,
 	param->drawctxt_id = context->id;
 	write_unlock(&device->context_lock);
 
+	context->thread_priv = kgsl_thread_private_open(device);
+	if (IS_ERR(context->thread_priv)) {
+		result = PTR_ERR(context->thread_priv);
+		goto done;
+	}
+
 done:
 	return result;
 }
@@ -1717,7 +1778,10 @@ static long gpumem_free_entry(struct kgsl_mem_entry *entry)
 			entry->memdesc.gpuaddr, entry->memdesc.size,
 			entry->memdesc.flags);
 
-	kgsl_mem_entry_put(entry);
+	if (kgsl_should_defer_gpumem_free(entry->priv))
+		kgsl_mem_entry_put_deferred(entry);
+	else
+		kgsl_mem_entry_put(entry);
 
 	return 0;
 }
@@ -1991,7 +2055,7 @@ static int memdesc_sg_virt(struct kgsl_memdesc *memdesc, unsigned long useraddr)
 	}
 
 	npages = get_user_pages(current, current->mm, useraddr,
-				sglen, write, 0, pages, NULL);
+					sglen, write, 0, pages, NULL);
 	up_read(&current->mm->mmap_sem);
 
 	ret = (npages < 0) ? (int)npages : 0;
@@ -4107,6 +4171,8 @@ static void kgsl_core_exit(void)
 static int __init kgsl_core_init(void)
 {
 	int result = 0;
+	struct sched_param param = { .sched_priority = 2 };
+
 	/* alloc major and minor device numbers */
 	result = alloc_chrdev_region(&kgsl_driver.major, 0, KGSL_DEVICE_MAX,
 		"kgsl");
@@ -4157,12 +4223,17 @@ static int __init kgsl_core_init(void)
 		kobject_create_and_add("proc",
 				       &kgsl_driver.virtdev.kobj);
 
+	kgsl_driver.threadkobj =
+		kobject_create_and_add("thread",
+				&kgsl_driver.virtdev.kobj);
+
 	kgsl_core_debugfs_init();
 
 	kgsl_sharedmem_init_sysfs();
 	kgsl_cffdump_init();
 
 	INIT_LIST_HEAD(&kgsl_driver.process_list);
+	INIT_LIST_HEAD(&kgsl_driver.thread_list);
 
 	INIT_LIST_HEAD(&kgsl_driver.pagetable_list);
 
@@ -4171,6 +4242,21 @@ static int __init kgsl_core_init(void)
 
 	kgsl_driver.mem_workqueue = alloc_workqueue("kgsl-mementry",
 		WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
+
+	kgsl_driver.dealloc_workqueue = alloc_workqueue("kgsl-dealloc",
+		WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
+
+	init_kthread_worker(&kgsl_driver.worker);
+
+	kgsl_driver.worker_thread = kthread_run(kthread_worker_fn,
+		&kgsl_driver.worker, "kgsl_worker_thread");
+
+	if (IS_ERR(kgsl_driver.worker_thread)) {
+		pr_err("unable to start kgsl thread\n");
+		goto err;
+	}
+
+	sched_setscheduler(kgsl_driver.worker_thread, SCHED_FIFO, &param);
 
 	kgsl_events_init();
 

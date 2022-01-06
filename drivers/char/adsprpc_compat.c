@@ -346,6 +346,26 @@ long compat_fastrpc_device_ioctl(struct file *filp, unsigned int cmd,
 		return filp->f_op->unlocked_ioctl(filp, FASTRPC_IOCTL_INIT,
 							(unsigned long)init);
 	}
+	case FASTRPC_IOCTL_GETINFO:
+	{
+		compat_uptr_t __user *info32;
+		uint32_t __user *info;
+		compat_uint_t u;
+		long ret;
+
+		info32 = compat_ptr(arg);
+		VERIFY(err, NULL != (info = compat_alloc_user_space(
+							sizeof(*info))));
+		if (err)
+			return -EFAULT;
+		ret = filp->f_op->unlocked_ioctl(filp, FASTRPC_IOCTL_GETINFO,
+							(unsigned long)info);
+		if (ret)
+			return ret;
+		err = get_user(u, info);
+		err |= put_user(u, info32);
+		return err;
+	}
 	case FASTRPC_IOCTL_SETMODE:
 		return filp->f_op->unlocked_ioctl(filp, cmd,
 						(unsigned long)compat_ptr(arg));

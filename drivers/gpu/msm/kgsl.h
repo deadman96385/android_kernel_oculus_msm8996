@@ -26,6 +26,7 @@
 #include <linux/mm.h>
 #include <linux/dma-attrs.h>
 #include <linux/uaccess.h>
+#include <linux/kthread.h>
 #include <asm/cacheflush.h>
 
 /* The number of memstore arrays limits the number of contexts allowed.
@@ -93,6 +94,7 @@ struct kgsl_context;
  * @virtdev: Virtual device for managing the core
  * @ptkobj: kobject for storing the pagetable statistics
  * @prockobj: kobject for storing the process statistics
+ * @threadkobj: kobject for storing thread statistics
  * @devp: Array of pointers to the individual KGSL device structs
  * @process_list: List of open processes
  * @pagetable_list: LIst of open pagetables
@@ -103,6 +105,10 @@ struct kgsl_context;
  * @full_cache_threshold: the threshold that triggers a full cache flush
  * @workqueue: Pointer to a single threaded workqueue
  * @mem_workqueue: Pointer to a workqueue for deferring memory entries
+ * @dealloc_workqueue: A dedicated workqueue used to deallocate memory
+ * entries for requests originating from latency sensitive threads; this
+ * is separate from @mem_workqueue to avoid failures when the latter is
+ * being drained
  */
 struct kgsl_driver {
 	struct cdev cdev;
@@ -111,8 +117,10 @@ struct kgsl_driver {
 	struct device virtdev;
 	struct kobject *ptkobj;
 	struct kobject *prockobj;
+	struct kobject *threadkobj;
 	struct kgsl_device *devp[KGSL_DEVICE_MAX];
 	struct list_head process_list;
+	struct list_head thread_list;
 	struct list_head pagetable_list;
 	spinlock_t ptlock;
 	struct mutex process_mutex;
@@ -132,6 +140,9 @@ struct kgsl_driver {
 	unsigned int full_cache_threshold;
 	struct workqueue_struct *workqueue;
 	struct workqueue_struct *mem_workqueue;
+	struct workqueue_struct *dealloc_workqueue;
+	struct kthread_worker worker;
+	struct task_struct *worker_thread;
 };
 
 extern struct kgsl_driver kgsl_driver;
@@ -283,7 +294,7 @@ struct kgsl_event {
 	void *priv;
 	struct list_head node;
 	unsigned int created;
-	struct work_struct work;
+	struct kthread_work work;
 	int result;
 	struct kgsl_event_group *group;
 };

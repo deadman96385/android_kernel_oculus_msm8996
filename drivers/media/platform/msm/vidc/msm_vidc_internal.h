@@ -45,6 +45,10 @@
 #define MIN_SUPPORTED_HEIGHT 32
 #define DEFAULT_FPS 15
 
+/* support 5.7k max resolution*/
+#define MAX_WIDTH_OVERRIDE_VALUE 5760
+#define MAX_HEIGHT_OVERRIDE_VALUE 5760
+
 /* Maintains the number of FTB's between each FBD over a window */
 #define DCVS_FTB_WINDOW 32
 

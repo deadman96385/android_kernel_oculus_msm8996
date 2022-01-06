@@ -18,6 +18,7 @@
 #include "dm-verity-fec.h"
 
 #include <linux/module.h>
+#include <linux/mount.h>
 #include <linux/reboot.h>
 
 #define DM_MSG_PREFIX			"verity"
@@ -501,6 +502,7 @@ static void verity_prefetch_io(struct work_struct *work)
 		container_of(work, struct dm_verity_prefetch_work, work);
 	struct dm_verity *v = pw->v;
 	int i;
+	sector_t prefetch_blocks;
 
 	for (i = v->levels - 2; i >= 0; i--) {
 		sector_t hash_block_start;
@@ -523,8 +525,15 @@ static void verity_prefetch_io(struct work_struct *work)
 				hash_block_end = v->hash_blocks - 1;
 		}
 no_prefetch_cluster:
+		prefetch_blocks =
+			max((sector_t)CONFIG_DM_VERITY_HASH_PREFETCH_MIN_SIZE,
+				hash_block_end - hash_block_start + 1);
+		if ((hash_block_start + prefetch_blocks) >=
+			(v->hash_start + v->hash_blocks)) {
+			prefetch_blocks = hash_block_end - hash_block_start + 1;
+		}
 		dm_bufio_prefetch(v->bufio, hash_block_start,
-				  hash_block_end - hash_block_start + 1);
+				  prefetch_blocks);
 	}
 
 	kfree(pw);
@@ -670,6 +679,7 @@ int verity_ioctl(struct dm_target *ti, unsigned cmd,
 	return r ? : __blkdev_driver_ioctl(v->data_dev->bdev, v->data_dev->mode,
 				     cmd, arg);
 }
+EXPORT_SYMBOL_GPL(verity_ioctl);
 
 int verity_merge(struct dm_target *ti, struct bvec_merge_data *bvm,
 			struct bio_vec *biovec, int max_size)
@@ -685,6 +695,7 @@ int verity_merge(struct dm_target *ti, struct bvec_merge_data *bvm,
 
 	return min(max_size, q->merge_bvec_fn(q, bvm, biovec));
 }
+EXPORT_SYMBOL_GPL(verity_merge);
 
 int verity_iterate_devices(struct dm_target *ti,
 				  iterate_devices_callout_fn fn, void *data)
@@ -844,6 +855,8 @@ int verity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	int i;
 	sector_t hash_position;
 	char dummy;
+	dev_t dev;
+	char devname[DM_VERITY_DEVNAME_SIZE];
 
 	v = kzalloc(sizeof(struct dm_verity), GFP_KERNEL);
 	if (!v) {
@@ -877,13 +890,24 @@ int verity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	}
 	v->version = num;
 
-	r = dm_get_device(ti, argv[1], FMODE_READ, &v->data_dev);
+	/*
+	 * Lookup by device name (i.e., /dev/sdeXX) does not work
+	 * during android verity initialization so we convert to
+	 * major:minor instead
+	 */
+	dev = name_to_dev_t(argv[1]);
+	snprintf(devname, DM_VERITY_DEVNAME_SIZE, "%u:%u",
+			MAJOR(dev), MINOR(dev));
+	r = dm_get_device(ti, devname, FMODE_READ, &v->data_dev);
 	if (r) {
 		ti->error = "Data device lookup failed";
 		goto bad;
 	}
 
-	r = dm_get_device(ti, argv[2], FMODE_READ, &v->hash_dev);
+	dev = name_to_dev_t(argv[2]);
+	snprintf(devname, DM_VERITY_DEVNAME_SIZE, "%u:%u",
+			MAJOR(dev), MINOR(dev));
+	r = dm_get_device(ti, devname, FMODE_READ, &v->hash_dev);
 	if (r) {
 		ti->error = "Data device lookup failed";
 		goto bad;

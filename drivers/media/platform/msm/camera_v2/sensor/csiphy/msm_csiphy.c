@@ -414,6 +414,7 @@ static int msm_csiphy_2phase_lane_config(
 				csiphy_dev->ctrl_reg->csiphy_3ph_reg.
 				mipi_csiphy_2ph_lnn_cfg5.addr + offset);
 		}
+
 		if (clk_lane == 1 && lane_mask != 0x18 &&
 			(csiphy_dev->hw_version == CSIPHY_VERSION_V342 ||
 			csiphy_dev->hw_version == CSIPHY_VERSION_V342_1)) {

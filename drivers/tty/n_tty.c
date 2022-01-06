@@ -1657,7 +1657,7 @@ static void __receive_buf(struct tty_struct *tty, const unsigned char *cp,
 	if (ldata->icanon && !L_EXTPROC(tty))
 		return;
 
-	/* publish read_head to consumer */
+	/* publish read head to consumer */
 	smp_store_release(&ldata->commit_head, ldata->read_head);
 
 	if ((read_cnt(ldata) >= ldata->minimum_to_wake) || L_EXTPROC(tty)) {
@@ -1722,7 +1722,7 @@ n_tty_receive_buf_common(struct tty_struct *tty, const unsigned char *cp,
 		 * the consumer has loaded the data in read_buf up to the new
 		 * read_tail (so this producer will not overwrite unread data)
 		 */
-		size_t tail = ldata->read_tail;
+		size_t tail = smp_load_acquire(&ldata->read_tail);
 
 		room = N_TTY_BUF_SIZE - (ldata->read_head - tail);
 		if (I_PARMRK(tty))
@@ -2004,8 +2004,8 @@ static int copy_from_read_buf(struct tty_struct *tty,
 		smp_store_release(&ldata->read_tail, ldata->read_tail + n);
 		/* Turn single EOF into zero-length read */
 		if (L_EXTPROC(tty) && ldata->icanon && is_eof &&
-		    (head == ldata->read_tail))
-			n = 0;
+			(head == ldata->read_tail))
+				n = 0;
 		*b += n;
 		*nr -= n;
 	}

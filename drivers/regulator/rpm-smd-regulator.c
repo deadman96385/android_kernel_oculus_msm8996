@@ -1616,9 +1616,25 @@ static int rpm_vreg_device_probe(struct platform_device *pdev)
 	reg->always_send_current
 		= of_property_read_bool(node, "qcom,always-send-current");
 
-	if (regulator_type == RPM_REGULATOR_TYPE_VS)
-		reg->rdesc.n_voltages = 0;
-	else
+	if (regulator_type == RPM_REGULATOR_TYPE_VS) {
+		u32 fixed_voltage;
+
+		/*
+		 * mfulghum (12 Oct. 2017) : Adding the "fixed-voltage" property
+		 * so that we can validate that everything attached to the
+		 * low-voltage switches are properly powered without breaking
+		 * the default behavior of Qualcomm's code (which it defaults to
+		 * if "fixed-voltage" is not set).
+		 */
+		rc = of_property_read_u32(node, "fixed-voltage",
+				&fixed_voltage);
+		if (rc) {
+			reg->rdesc.n_voltages = 0;
+		} else {
+			reg->rdesc.n_voltages = 1;
+			reg->rdesc.fixed_uV = (int)fixed_voltage;
+		}
+	} else
 		reg->rdesc.n_voltages = 2;
 
 	rc = of_property_read_u32(node, "qcom,set", &val);

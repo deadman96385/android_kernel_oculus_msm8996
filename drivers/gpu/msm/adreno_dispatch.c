@@ -19,6 +19,7 @@
 
 #include "kgsl.h"
 #include "kgsl_cffdump.h"
+#include "kgsl_device.h"
 #include "kgsl_sharedmem.h"
 #include "adreno.h"
 #include "adreno_ringbuffer.h"
@@ -560,6 +561,7 @@ static int sendcmd(struct adreno_device *adreno_dev,
 	struct adreno_context *drawctxt = ADRENO_CONTEXT(cmdbatch->context);
 	struct adreno_dispatcher_cmdqueue *dispatch_q =
 				ADRENO_CMDBATCH_DISPATCH_CMDQUEUE(cmdbatch);
+	struct kgsl_thread_private *thread = drawctxt->base.thread_priv;
 	struct adreno_submit_time time;
 	uint64_t secs = 0;
 	unsigned long nsecs = 0;
@@ -648,6 +650,16 @@ static int sendcmd(struct adreno_device *adreno_dev,
 
 	secs = time.ktime;
 	nsecs = do_div(secs, 1000000000);
+
+	thread->sync_ktime = time.ktime;
+	thread->sync_ticks = time.ticks;
+	thread->stats[KGSL_THREADSTATS_SUBMITTED] = time.ktime;
+	thread->stats[KGSL_THREADSTATS_SUBMITTED_ID] = cmdbatch->timestamp;
+	thread->stats[KGSL_THREADSTATS_SUBMITTED_COUNT]++;
+
+	sysfs_notify_dirent(thread->event_sd[KGSL_THREADSTATS_SUBMITTED]);
+	sysfs_notify_dirent(thread->event_sd[KGSL_THREADSTATS_SUBMITTED_ID]);
+	sysfs_notify_dirent(thread->event_sd[KGSL_THREADSTATS_SUBMITTED_COUNT]);
 
 	trace_adreno_cmdbatch_submitted(cmdbatch, (int) dispatcher->inflight,
 		time.ticks, (unsigned long) secs, nsecs / 1000, drawctxt->rb,
@@ -981,6 +993,7 @@ int adreno_dispatcher_queue_cmd(struct adreno_device *adreno_dev,
 {
 	struct adreno_dispatcher_cmdqueue *dispatch_q =
 				ADRENO_CMDBATCH_DISPATCH_CMDQUEUE(cmdbatch);
+	struct kgsl_thread_private *thread = drawctxt->base.thread_priv;
 	int ret;
 
 	spin_lock(&drawctxt->lock);
@@ -1143,6 +1156,15 @@ int adreno_dispatcher_queue_cmd(struct adreno_device *adreno_dev,
 	}
 
 	drawctxt->queued++;
+
+	thread->stats[KGSL_THREADSTATS_QUEUED] = local_clock();
+	thread->stats[KGSL_THREADSTATS_QUEUED_ID] = cmdbatch->timestamp;
+	thread->stats[KGSL_THREADSTATS_QUEUED_COUNT]++;
+
+	sysfs_notify_dirent(thread->event_sd[KGSL_THREADSTATS_QUEUED]);
+	sysfs_notify_dirent(thread->event_sd[KGSL_THREADSTATS_QUEUED_ID]);
+	sysfs_notify_dirent(thread->event_sd[KGSL_THREADSTATS_QUEUED_COUNT]);
+
 	trace_adreno_cmdbatch_queued(cmdbatch, drawctxt->queued);
 
 	_track_context(adreno_dev, dispatch_q, drawctxt);
@@ -1163,8 +1185,18 @@ int adreno_dispatcher_queue_cmd(struct adreno_device *adreno_dev,
 	 * queue will try to schedule new commands anyway.
 	 */
 
-	if (dispatch_q->inflight < _context_cmdbatch_burst)
-		adreno_dispatcher_issuecmds(adreno_dev);
+	if (dispatch_q->inflight < _context_cmdbatch_burst) {
+		/*
+		 * If called on a high priority context, try to issue commands
+		 * immediately, otherwise queue it on the kthread.  This avoids
+		 * submission delays due to priority inversion when a low-pri
+		 * thread gets preempted after acquiring the dispatcher mutex.
+		 */
+		if (kgsl_context_high_priority(&drawctxt->base))
+			adreno_dispatcher_issuecmds(adreno_dev);
+		else
+			adreno_dispatcher_schedule(KGSL_DEVICE(adreno_dev));
+	}
 
 	return 0;
 }
@@ -1926,6 +1958,7 @@ static void retire_cmdbatch(struct adreno_device *adreno_dev,
 {
 	struct adreno_dispatcher *dispatcher = &adreno_dev->dispatcher;
 	struct adreno_context *drawctxt = ADRENO_CONTEXT(cmdbatch->context);
+	struct kgsl_thread_private *thread = drawctxt->base.thread_priv;
 	uint64_t start = 0, end = 0;
 
 	if (cmdbatch->fault_recovery != 0) {
@@ -1933,8 +1966,29 @@ static void retire_cmdbatch(struct adreno_device *adreno_dev,
 		_print_recovery(KGSL_DEVICE(adreno_dev), cmdbatch);
 	}
 
-	if (test_bit(CMDBATCH_FLAG_PROFILE, &cmdbatch->priv))
+	if (test_bit(CMDBATCH_FLAG_PROFILE, &cmdbatch->priv)) {
 		cmdbatch_profile_ticks(adreno_dev, cmdbatch, &start, &end);
+
+		/*
+		 * Calculate the time delta from the sync in nsecs by converting
+		 * from GPU ticks (which operates on a 19.2 MHz timer) and
+		 * add that to the sync ktime.
+		 */
+		thread->stats[KGSL_THREADSTATS_SUBMITTED] = thread->sync_ktime +
+			(start - thread->sync_ticks) * 10000 / 192;
+		thread->stats[KGSL_THREADSTATS_RETIRED] = thread->sync_ktime +
+			(end - thread->sync_ticks) * 10000 / 192;
+		thread->stats[KGSL_THREADSTATS_ACTIVE_TIME] +=
+			(end - start) * 10000 / 192;
+	}
+
+	thread->stats[KGSL_THREADSTATS_RETIRED_ID] = cmdbatch->timestamp;
+	thread->stats[KGSL_THREADSTATS_RETIRED_COUNT]++;
+
+	sysfs_notify_dirent(thread->event_sd[KGSL_THREADSTATS_RETIRED]);
+	sysfs_notify_dirent(thread->event_sd[KGSL_THREADSTATS_RETIRED_ID]);
+	sysfs_notify_dirent(thread->event_sd[KGSL_THREADSTATS_RETIRED_COUNT]);
+	sysfs_notify_dirent(thread->event_sd[KGSL_THREADSTATS_ACTIVE_TIME]);
 
 	/*
 	 * For A3xx we still get the rptr from the CP_RB_RPTR instead of
@@ -2096,7 +2150,7 @@ static void _dispatcher_power_down(struct adreno_device *adreno_dev)
 	mutex_unlock(&device->mutex);
 }
 
-static void adreno_dispatcher_work(struct work_struct *work)
+static void adreno_dispatcher_work(struct kthread_work *work)
 {
 	struct adreno_dispatcher *dispatcher =
 		container_of(work, struct adreno_dispatcher, work);
@@ -2156,7 +2210,7 @@ void adreno_dispatcher_schedule(struct kgsl_device *device)
 	struct adreno_device *adreno_dev = ADRENO_DEVICE(device);
 	struct adreno_dispatcher *dispatcher = &adreno_dev->dispatcher;
 
-	kgsl_schedule_work(&dispatcher->work);
+	queue_kthread_work(&kgsl_driver.worker, &dispatcher->work);
 }
 
 /**
@@ -2438,7 +2492,7 @@ int adreno_dispatcher_init(struct adreno_device *adreno_dev)
 	setup_timer(&dispatcher->fault_timer, adreno_dispatcher_fault_timer,
 		(unsigned long) adreno_dev);
 
-	INIT_WORK(&dispatcher->work, adreno_dispatcher_work);
+	init_kthread_work(&dispatcher->work, adreno_dispatcher_work);
 
 	init_completion(&dispatcher->idle_gate);
 	complete_all(&dispatcher->idle_gate);

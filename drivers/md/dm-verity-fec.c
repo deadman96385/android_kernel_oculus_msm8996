@@ -11,6 +11,7 @@
 
 #include "dm-verity-fec.h"
 #include <linux/math64.h>
+#include <linux/mount.h>
 #include <linux/sysfs.h>
 
 #define DM_MSG_PREFIX	"verity-fec"
@@ -442,6 +443,13 @@ int verity_fec_decode(struct dm_verity *v, struct dm_verity_io *io,
 	if (!verity_fec_is_enabled(v))
 		return -EOPNOTSUPP;
 
+	if (fio->level >= DM_VERITY_FEC_MAX_RECURSION) {
+		DMWARN_LIMIT("%s: FEC: recursion too deep", v->data_dev->name);
+		return -EIO;
+	}
+
+	fio->level++;
+
 	if (type == DM_VERITY_BLOCK_TYPE_METADATA)
 		block += v->data_blocks;
 
@@ -456,9 +464,7 @@ int verity_fec_decode(struct dm_verity *v, struct dm_verity_io *io,
 	 */
 
 	offset = block << v->data_dev_block_bits;
-
-	res = offset;
-	div64_u64(res, v->fec->rounds << v->data_dev_block_bits);
+	res = div64_u64(offset, v->fec->rounds << v->data_dev_block_bits);
 
 	/*
 	 * The base RS block we can feed to the interleaver to find out all
@@ -475,7 +481,7 @@ int verity_fec_decode(struct dm_verity *v, struct dm_verity_io *io,
 	if (r < 0) {
 		r = fec_decode_rsb(v, io, fio, rsb, offset, true);
 		if (r < 0)
-			return r;
+			goto done;
 	}
 
 	if (dest)
@@ -485,6 +491,8 @@ int verity_fec_decode(struct dm_verity *v, struct dm_verity_io *io,
 		r = verity_for_bv_block(v, io, iter, fec_bv_copy);
 	}
 
+done:
+	fio->level--;
 	return r;
 }
 
@@ -525,6 +533,7 @@ void verity_fec_init_io(struct dm_verity_io *io)
 	memset(fio->bufs, 0, sizeof(fio->bufs));
 	fio->nbufs = 0;
 	fio->output = NULL;
+	fio->level = 0;
 }
 
 /*
@@ -611,6 +620,8 @@ int verity_fec_parse_opt_args(struct dm_arg_set *as, struct dm_verity *v,
 	unsigned long long num_ll;
 	unsigned char num_c;
 	char dummy;
+	char devname[DM_VERITY_DEVNAME_SIZE];
+	dev_t dev;
 
 	if (!*argc) {
 		ti->error = "FEC feature arguments require a value";
@@ -619,14 +630,20 @@ int verity_fec_parse_opt_args(struct dm_arg_set *as, struct dm_verity *v,
 
 	arg_value = dm_shift_arg(as);
 	(*argc)--;
-
 	if (!strcasecmp(arg_name, DM_VERITY_OPT_FEC_DEV)) {
-		r = dm_get_device(ti, arg_value, FMODE_READ, &v->fec->dev);
+		/*
+		 * Lookup by device name (i.e., /dev/sdeXX) does not work
+		 * during android verity initialization so we convert to
+		 * major:minor instead
+		 */
+		dev = name_to_dev_t((char *)arg_value);
+		snprintf(devname, DM_VERITY_DEVNAME_SIZE, "%u:%u",
+				MAJOR(dev), MINOR(dev));
+		r = dm_get_device(ti, devname, FMODE_READ, &v->fec->dev);
 		if (r) {
 			ti->error = "FEC device lookup failed";
 			return r;
 		}
-
 	} else if (!strcasecmp(arg_name, DM_VERITY_OPT_FEC_BLOCKS)) {
 		if (sscanf(arg_value, "%llu%c", &num_ll, &dummy) != 1 ||
 		    ((sector_t)(num_ll << (v->data_dev_block_bits - SECTOR_SHIFT))
@@ -680,7 +697,8 @@ static struct attribute *fec_attrs[] = {
 
 static struct kobj_type fec_ktype = {
 	.sysfs_ops = &kobj_sysfs_ops,
-	.default_attrs = fec_attrs
+	.default_attrs = fec_attrs,
+	.release = dm_kobject_release
 };
 
 /*

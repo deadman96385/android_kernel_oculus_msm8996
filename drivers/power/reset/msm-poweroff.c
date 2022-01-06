@@ -60,16 +60,18 @@ static void scm_disable_sdi(void);
 * There is no API from TZ to re-enable the registers.
 * So the SDI cannot be re-enabled when it already by-passed.
 */
-static int download_mode = 1;
+static int download_mode;
 #else
 static const int download_mode;
 #endif
+
+static int in_panic;
+static int is_warm_reset;
 
 #ifdef CONFIG_MSM_DLOAD_MODE
 #define EDL_MODE_PROP "qcom,msm-imem-emergency_download_mode"
 #define DL_MODE_PROP "qcom,msm-imem-download_mode"
 
-static int in_panic;
 static void *dload_mode_addr;
 static bool dload_mode_enabled;
 static void *emergency_dload_mode_addr;
@@ -94,6 +96,7 @@ struct reset_attribute {
 
 module_param_call(download_mode, dload_set, param_get_int,
 			&download_mode, 0644);
+#endif
 
 static int panic_prep_restart(struct notifier_block *this,
 			      unsigned long event, void *ptr)
@@ -106,6 +109,7 @@ static struct notifier_block panic_blk = {
 	.notifier_call	= panic_prep_restart,
 };
 
+#ifdef CONFIG_MSM_DLOAD_MODE
 int scm_set_dload_mode(int arg1, int arg2)
 {
 	struct scm_desc desc = {
@@ -279,26 +283,30 @@ static void msm_restart_prepare(const char *cmd)
 			(in_panic || restart_mode == RESTART_DLOAD));
 #endif
 
+	pr_notice("%s: restart by command: [%s] panic=%d\r\n",
+			__func__, (cmd) ? cmd : "", in_panic);
+
 	if (qpnp_pon_check_hard_reset_stored()) {
 		/* Set warm reset as true when device is in dload mode */
-		if (get_dload_mode() ||
+		if ((get_dload_mode() || in_panic) ||
 			((cmd != NULL && cmd[0] != '\0') &&
 			!strcmp(cmd, "edl")))
 			need_warm_reset = true;
 	} else {
-		need_warm_reset = (get_dload_mode() ||
-				((cmd != NULL && cmd[0] != '\0') &&
-				strcmp(cmd, "userrequested")));
+		need_warm_reset = (get_dload_mode() || in_panic);
 	}
 
 	/* Hard reset the PMIC unless memory contents must be maintained. */
 	if (need_warm_reset) {
 		qpnp_pon_system_pwr_off(PON_POWER_OFF_WARM_RESET);
+		is_warm_reset = 1;
 	} else {
 		qpnp_pon_system_pwr_off(PON_POWER_OFF_HARD_RESET);
 	}
 
-	if (cmd != NULL) {
+	if (in_panic) {
+		/*  leave it alone */
+	} else if (cmd != NULL) {
 		if (!strncmp(cmd, "bootloader", 10)) {
 			qpnp_pon_set_restart_reason(
 				PON_RESTART_REASON_BOOTLOADER);
@@ -323,14 +331,20 @@ static void msm_restart_prepare(const char *cmd)
 			qpnp_pon_set_restart_reason(
 				PON_RESTART_REASON_KEYS_CLEAR);
 			__raw_writel(0x7766550a, restart_reason);
-		} else if (!strncmp(cmd, "oem-", 4)) {
-			unsigned long code;
-			int ret;
-			ret = kstrtoul(cmd + 4, 16, &code);
-			if (!ret)
-				__raw_writel(0x6f656d00 | (code & 0xff),
-					     restart_reason);
-		} else if (!strncmp(cmd, "edl", 3)) {
+		} else if (!strcmp(cmd, "oem unlock")) {
+			qpnp_pon_set_restart_reason(
+				PON_RESTART_REASON_OEM_UNLOCK);
+			__raw_writel(0x6f656d00, restart_reason);
+		} else if (!strcmp(cmd, "upgrade")) {
+			qpnp_pon_set_restart_reason(
+				PON_RESTART_REASON_UPGRADE);
+			__raw_writel(0x6f656d00, restart_reason);
+		} else if (!strcmp(cmd, "silent-boot")) {
+			qpnp_pon_set_restart_reason(
+				PON_RESTART_REASON_SILENT_BOOT);
+			__raw_writel(0x6f656d00, restart_reason);
+		} else if (!strncmp(cmd, "edl", 3) ||
+				!strncmp(cmd, "download", 8)) {
 			enable_emergency_dload_mode();
 		} else {
 			__raw_writel(0x77665501, restart_reason);
@@ -382,7 +396,7 @@ static void do_msm_restart(enum reboot_mode reboot_mode, const char *cmd)
 	 * device will take the usual restart path.
 	 */
 
-	if (WDOG_BITE_ON_PANIC && in_panic)
+	if ((WDOG_BITE_ON_PANIC && in_panic) || is_warm_reset)
 		msm_trigger_wdog_bite();
 #endif
 
@@ -496,11 +510,12 @@ static int msm_restart_probe(struct platform_device *pdev)
 	struct device_node *np;
 	int ret = 0;
 
+	atomic_notifier_chain_register(&panic_notifier_list, &panic_blk);
+
 #ifdef CONFIG_MSM_DLOAD_MODE
 	if (scm_is_call_available(SCM_SVC_BOOT, SCM_DLOAD_CMD) > 0)
 		scm_dload_supported = true;
 
-	atomic_notifier_chain_register(&panic_notifier_list, &panic_blk);
 	np = of_find_compatible_node(NULL, NULL, DL_MODE_PROP);
 	if (!np) {
 		pr_err("unable to find DT imem DLOAD mode node\n");

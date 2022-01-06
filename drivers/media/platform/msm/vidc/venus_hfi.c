@@ -2146,6 +2146,7 @@ static int venus_hfi_core_init(void *device)
 {
 	struct hfi_cmd_sys_init_packet pkt;
 	struct hfi_cmd_sys_get_property_packet version_pkt;
+	struct hfi_cmd_sys_set_property_packet feature_pkt;
 	int rc = 0;
 	struct list_head *ptr, *next;
 	struct hal_session *session = NULL;
@@ -2229,6 +2230,19 @@ static int venus_hfi_core_init(void *device)
 	rc = call_hfi_pkt_op(dev, sys_image_version, &version_pkt);
 	if (rc || __iface_cmdq_write(dev, &version_pkt))
 		dprintk(VIDC_WARN, "Failed to send image version pkt to f/w\n");
+
+	rc = call_hfi_pkt_op(dev, sys_feature_config, &feature_pkt);
+	if (rc) {
+		dprintk(VIDC_ERR, "Failed to create feature config pkt\n");
+		goto err_core_init;
+	}
+
+	if (__iface_cmdq_write(dev, &feature_pkt)) {
+		dprintk(VIDC_WARN,
+			"Failed to set max resolution feature in f/w\n");
+		rc = -ENOTEMPTY;
+		goto err_core_init;
+	}
 
 	if (dev->res->pm_qos_latency_us) {
 #ifdef CONFIG_SMP
@@ -2453,7 +2467,16 @@ static void __set_default_sys_properties(struct venus_hfi_device *device)
 
 static void __session_clean(struct hal_session *session)
 {
+	struct vidc_buffer_entry *buf_entry, *next;
+
 	dprintk(VIDC_DBG, "deleted the session: %pK\n", session);
+
+	list_for_each_entry_safe(
+			buf_entry, next, &session->profile_head, list) {
+		list_del(&buf_entry->list);
+		kfree(buf_entry);
+	}
+
 	list_del(&session->list);
 	/* Poison the session handle with zeros */
 	*session = (struct hal_session){ {0} };
@@ -2513,6 +2536,8 @@ static int venus_hfi_session_init(void *device, void *session_id,
 	s->device = dev;
 	s->codec = codec_type;
 	s->domain = session_type;
+	INIT_LIST_HEAD(&s->profile_head);
+
 	dprintk(VIDC_DBG,
 		"%s: inst %pK, session %pK, codec 0x%x, domain 0x%x\n",
 		__func__, session_id, s, s->codec, s->domain);
@@ -2921,7 +2946,7 @@ static int venus_hfi_session_process_batch(void *sess,
 		int num_etbs, struct vidc_frame_data etbs[],
 		int num_ftbs, struct vidc_frame_data ftbs[])
 {
-	int rc = 0, c = 0;
+	int rc = -EINVAL, c = 0;
 	struct hal_session *session = sess;
 	struct venus_hfi_device *device;
 	struct hfi_cmd_session_sync_process_packet pkt;
@@ -3552,6 +3577,17 @@ static int __response_handler(struct venus_hfi_device *device)
 			}
 
 			*session_id = session->session_id;
+
+			if (info->response_type == HAL_SESSION_FTB_DONE) {
+				u64 timestamp;
+				struct vidc_hal_fbd *data =
+					&info->response.data.output_done;
+
+				timestamp = (((u64)data->timestamp_hi) << 32)
+					+ ((u64)data->timestamp_lo);
+				vidc_profile_end(session, timestamp,
+					session->is_decoder);
+			}
 		}
 
 		if (packet_count >= max_packets) {
@@ -4696,4 +4732,3 @@ int venus_hfi_initialize(struct hfi_device *hdev, u32 device_id,
 err_venus_hfi_init:
 	return rc;
 }
-

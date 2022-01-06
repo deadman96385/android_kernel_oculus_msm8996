@@ -299,6 +299,19 @@ config BW_MONITOR
 	 it by registering the bus bandwidth as a sensor in
 	 thermal core framework.
 
+config OCULUS
+	bool "Support for Oculus hardware"
+	default y
+	help
+	  Enable support for Oculus systems and boards.
+
+config PACIFIC_BOARD
+	depends on OCULUS
+	default n
+	bool "Pacific board driver"
+	help
+	  Support for the Oculus Pacific device.
+
 source "drivers/platform/msm/spmi/Kconfig"
 
 endmenu

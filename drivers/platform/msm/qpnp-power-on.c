@@ -29,6 +29,8 @@
 #include <linux/regulator/machine.h>
 #include <linux/regulator/of_regulator.h>
 #include <linux/qpnp/power-on.h>
+#include <linux/proc_fs.h>
+#include <linux/sysctl.h>
 
 #define CREATE_MASK(NUM_BITS, POS) \
 	((unsigned char) (((1 << (NUM_BITS)) - 1) << (POS)))
@@ -221,6 +223,10 @@ struct qpnp_pon {
 	bool			kpdpwr_dbc_enable;
 	ktime_t			kpdpwr_last_release_time;
 };
+
+/* ctl_table data pointers are const */
+static int sysctl_startup_reason;
+static int sysctl_shutdown_reason;
 
 static struct qpnp_pon *sys_reset_dev;
 static DEFINE_SPINLOCK(spon_list_slock);
@@ -1746,7 +1752,7 @@ static bool smpl_en;
 
 static int qpnp_pon_smpl_en_get(char *buf, const struct kernel_param *kp)
 {
-	bool enabled;
+	bool enabled = false;
 	int rc;
 
 	rc = qpnp_pon_get_trigger_config(PON_SMPL, &enabled);
@@ -2091,11 +2097,13 @@ static int qpnp_pon_probe(struct spmi_device *spmi)
 	index = ffs(pon_sts) - 1;
 	cold_boot = !qpnp_pon_is_warm_reset();
 	if (index >= ARRAY_SIZE(qpnp_pon_reason) || index < 0) {
+		sysctl_startup_reason = -1;
 		dev_info(&pon->spmi->dev,
 			"PMIC@SID%d Power-on reason: Unknown and '%s' boot\n",
 			pon->spmi->sid, cold_boot ? "cold" : "warm");
 	} else {
 		pon->pon_trigger_reason = index;
+		sysctl_startup_reason = index;
 		dev_info(&pon->spmi->dev,
 			"PMIC@SID%d Power-on reason: %s and '%s' boot\n",
 			pon->spmi->sid, qpnp_pon_reason[index],
@@ -2121,11 +2129,13 @@ static int qpnp_pon_probe(struct spmi_device *spmi)
 	}
 	index = ffs(poff_sts) - 1 + reason_index_offset;
 	if (index >= ARRAY_SIZE(qpnp_poff_reason) || index < 0) {
+		sysctl_shutdown_reason = -1;
 		dev_info(&pon->spmi->dev,
 				"PMIC@SID%d: Unknown power-off reason\n",
 				pon->spmi->sid);
 	} else {
 		pon->pon_power_off_reason = index;
+		sysctl_shutdown_reason = index;
 		dev_info(&pon->spmi->dev,
 				"PMIC@SID%d: Power-off reason: %s\n",
 				pon->spmi->sid,
@@ -2367,14 +2377,55 @@ static struct spmi_driver qpnp_pon_driver = {
 	.remove		= qpnp_pon_remove,
 };
 
+/* Place files in /proc/sys/kernel */
+static struct ctl_table pon_table[] = {
+	{
+		.procname	= "startup_reason",
+		.data		= &sysctl_startup_reason,
+		.maxlen	    = sizeof(sysctl_startup_reason),
+		.mode		= 0444,
+		.proc_handler	= proc_dointvec,
+	},
+	{
+		.procname	= "shutdown_reason",
+		.data		= &sysctl_shutdown_reason,
+		.maxlen		= sizeof(sysctl_shutdown_reason),
+		.mode		= 0444,
+		.proc_handler	= proc_dointvec,
+	},
+	{ }
+};
+
+static struct ctl_table pon_root_table[] = {
+	{
+		.procname	= "kernel",
+		.maxlen		= 0,
+		.mode		= 0555,
+		.child		= pon_table,
+	},
+	{ }
+};
+static struct ctl_table_header *pon_sysctl_header;
+
 static int __init qpnp_pon_init(void)
 {
+	sysctl_startup_reason = -1;
+	sysctl_shutdown_reason = -1;
+
+	pon_sysctl_header = register_sysctl_table(pon_root_table);
+	if (!pon_sysctl_header) {
+		pr_err("qpnp-power-on: Unable to register startup/shutdown_reason sysctls\n");
+		return -ENOMEM;
+	}
+
 	return spmi_driver_register(&qpnp_pon_driver);
 }
 subsys_initcall(qpnp_pon_init);
 
 static void __exit qpnp_pon_exit(void)
 {
+	unregister_sysctl_table(pon_sysctl_header);
+
 	return spmi_driver_unregister(&qpnp_pon_driver);
 }
 module_exit(qpnp_pon_exit);

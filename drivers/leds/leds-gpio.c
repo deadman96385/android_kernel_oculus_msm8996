@@ -19,6 +19,7 @@
 #include <linux/of_gpio.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
+#include <linux/regulator/consumer.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
 
@@ -239,7 +240,18 @@ static int gpio_led_probe(struct platform_device *pdev)
 {
 	struct gpio_led_platform_data *pdata = dev_get_platdata(&pdev->dev);
 	struct gpio_leds_priv *priv;
+	struct regulator *vcc_ana;
+
 	int i, ret = 0;
+
+	vcc_ana = regulator_get(&pdev->dev, "vcc_ana");
+	if (!IS_ERR(vcc_ana)) {
+		if (regulator_count_voltages(vcc_ana) > 0) {
+			ret = regulator_set_voltage(vcc_ana, 3000000, 3000000);
+			if (!ret)
+				ret = regulator_enable(vcc_ana);
+		}
+	}
 
 	if (pdata && pdata->num_leds) {
 		priv = devm_kzalloc(&pdev->dev,

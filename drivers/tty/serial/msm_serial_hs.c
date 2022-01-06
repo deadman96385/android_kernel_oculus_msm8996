@@ -40,6 +40,7 @@
 #include <linux/irq.h>
 #include <linux/io.h>
 #include <linux/ioport.h>
+#include <linux/irq.h>
 #include <linux/atomic.h>
 #include <linux/kernel.h>
 #include <linux/timer.h>
@@ -2243,7 +2244,7 @@ void disable_wakeup_interrupt(struct msm_hs_port *msm_uport)
 		return;
 
 	if (msm_uport->wakeup.enabled) {
-		disable_irq_nosync(msm_uport->wakeup.irq);
+		disable_irq(msm_uport->wakeup.irq);
 		enable_irq(uport->irq);
 		spin_lock_irqsave(&uport->lock, flags);
 		msm_uport->wakeup.enabled = false;
@@ -2602,8 +2603,8 @@ static int msm_hs_startup(struct uart_port *uport)
 	msm_hs_resource_vote(msm_uport);
 
 	if (is_use_low_power_wakeup(msm_uport)) {
-		ret = request_threaded_irq(msm_uport->wakeup.irq, NULL,
-					msm_hs_wakeup_isr,
+		irq_set_status_flags(msm_uport->wakeup.irq, IRQ_DISABLE_UNLAZY);
+		ret = request_irq(msm_uport->wakeup.irq, msm_hs_wakeup_isr,
 					IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
 					"msm_hs_wakeup", msm_uport);
 		if (unlikely(ret)) {
@@ -2733,6 +2734,11 @@ unconfig_uart_gpios:
 	msm_hs_unconfig_uart_gpios(uport);
 free_uart_irq:
 	free_irq(uport->irq, msm_uport);
+	if (is_use_low_power_wakeup(msm_uport)) {
+		irq_clear_status_flags(msm_uport->wakeup.irq,
+			IRQ_DISABLE_UNLAZY);
+		free_irq(msm_uport->wakeup.irq, msm_uport);
+	}
 unvote_exit:
 	msm_hs_resource_unvote(msm_uport);
 	MSM_HS_ERR("%s(): Error return\n", __func__);
@@ -2746,6 +2752,7 @@ static int uartdm_init_port(struct uart_port *uport)
 	struct msm_hs_port *msm_uport = UARTDM_TO_MSM(uport);
 	struct msm_hs_tx *tx = &msm_uport->tx;
 	struct msm_hs_rx *rx = &msm_uport->rx;
+	struct sched_param param = { .sched_priority = 1 };
 
 	init_waitqueue_head(&rx->wait);
 	init_waitqueue_head(&tx->wait);
@@ -2760,6 +2767,8 @@ static int uartdm_init_port(struct uart_port *uport)
 		MSM_HS_ERR("%s(): error creating task", __func__);
 		goto exit_lh_init;
 	}
+	sched_setscheduler(rx->task, SCHED_FIFO, &param);
+
 	init_kthread_work(&rx->kwork, msm_serial_hs_rx_work);
 
 	init_kthread_worker(&tx->kworker);
@@ -2769,6 +2778,7 @@ static int uartdm_init_port(struct uart_port *uport)
 		MSM_HS_ERR("%s(): error creating task", __func__);
 		goto exit_lh_init;
 	}
+	sched_setscheduler(tx->task, SCHED_FIFO, &param);
 
 	init_kthread_work(&tx->kwork, msm_serial_hs_tx_work);
 
@@ -3651,6 +3661,8 @@ static void msm_hs_shutdown(struct uart_port *uport)
 	/* Free the interrupt */
 	free_irq(uport->irq, msm_uport);
 	if (is_use_low_power_wakeup(msm_uport)) {
+		irq_clear_status_flags(msm_uport->wakeup.irq,
+			IRQ_DISABLE_UNLAZY);
 		free_irq(msm_uport->wakeup.irq, msm_uport);
 		MSM_HS_DBG("%s(): wakeup irq freed", __func__);
 	}

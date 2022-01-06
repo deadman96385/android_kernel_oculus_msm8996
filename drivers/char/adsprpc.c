@@ -822,9 +822,9 @@ static int overlap_ptr_cmp(const void *a, const void *b)
 	return st == 0 ? ed : st;
 }
 
-static int context_build_overlap(struct smq_invoke_ctx *ctx)
+static void context_build_overlap(struct smq_invoke_ctx *ctx)
 {
-	int i, err = 0;
+	int i;
 	remote_arg_t *lpra = ctx->lpra;
 	int inbufs = REMOTE_SCALARS_INBUFS(ctx->sc);
 	int outbufs = REMOTE_SCALARS_OUTBUFS(ctx->sc);
@@ -834,11 +834,6 @@ static int context_build_overlap(struct smq_invoke_ctx *ctx)
 	for (i = 0; i < nbufs; ++i) {
 		ctx->overs[i].start = (uintptr_t)lpra[i].buf.pv;
 		ctx->overs[i].end = ctx->overs[i].start + lpra[i].buf.len;
-		if (lpra[i].buf.len) {
-			VERIFY(err, ctx->overs[i].end > ctx->overs[i].start);
-			if (err)
-				goto bail;
-		}
 		ctx->overs[i].raix = i;
 		ctx->overps[i] = &ctx->overs[i];
 	}
@@ -864,8 +859,6 @@ static int context_build_overlap(struct smq_invoke_ctx *ctx)
 			max = *ctx->overps[i];
 		}
 	}
-bail:
-	return err;
 }
 
 #define K_COPY_FROM_USER(err, kernel, dst, src, size) \
@@ -931,11 +924,8 @@ static int context_alloc(struct fastrpc_file *fl, uint32_t kernel,
 			goto bail;
 	}
 	ctx->sc = invoke->sc;
-	if (bufs) {
-		VERIFY(err, 0 == context_build_overlap(ctx));
-		if (err)
-			goto bail;
-	}
+	if (bufs)
+		context_build_overlap(ctx);
 	ctx->retval = -1;
 	ctx->pid = current->pid;
 	ctx->tgid = current->tgid;
@@ -1153,24 +1143,14 @@ static int get_args(uint32_t kernel, struct smq_invoke_ctx *ctx)
 	/* calculate len required for copying */
 	for (oix = 0; oix < inbufs + outbufs; ++oix) {
 		int i = ctx->overps[oix]->raix;
-		uintptr_t mstart, mend;
 		size_t len = lpra[i].buf.len;
-
 		if (!len)
 			continue;
 		if (ctx->maps[i])
 			continue;
 		if (ctx->overps[oix]->offset == 0)
 			copylen = ALIGN(copylen, BALIGN);
-		mstart = ctx->overps[oix]->mstart;
-		mend = ctx->overps[oix]->mend;
-		VERIFY(err, (mend - mstart) <= LONG_MAX);
-		if (err)
-			goto bail;
-		copylen += mend - mstart;
-		VERIFY(err, copylen >= 0);
-		if (err)
-			goto bail;
+		copylen += ctx->overps[oix]->mend - ctx->overps[oix]->mstart;
 	}
 	ctx->used = copylen;
 
@@ -1238,7 +1218,7 @@ static int get_args(uint32_t kernel, struct smq_invoke_ctx *ctx)
 	for (oix = 0; rpra && lrpra && oix < inbufs + outbufs; ++oix) {
 		int i = ctx->overps[oix]->raix;
 		struct fastrpc_mmap *map = ctx->maps[i];
-		size_t mlen;
+		int mlen = ctx->overps[oix]->mend - ctx->overps[oix]->mstart;
 		uint64_t buf;
 		size_t len = lpra[i].buf.len;
 
@@ -1250,7 +1230,6 @@ static int get_args(uint32_t kernel, struct smq_invoke_ctx *ctx)
 			rlen -= ALIGN(args, BALIGN) - args;
 			args = ALIGN(args, BALIGN);
 		}
-		mlen = ctx->overps[oix]->mend - ctx->overps[oix]->mstart;
 		VERIFY(err, rlen >= mlen);
 		if (err)
 			goto bail;
@@ -1653,10 +1632,12 @@ static int fastrpc_init_process(struct fastrpc_file *fl,
 			init->filelen));
 		if (err)
 			goto bail;
-		VERIFY(err, !fastrpc_mmap_create(fl, init->filefd, init->file,
-					init->filelen, mflags, &file));
+		if (init->filelen) {
+			VERIFY(err, !fastrpc_mmap_create(fl, init->filefd,
+				init->file, init->filelen, mflags, &file));
 		if (err)
 			goto bail;
+	}
 		inbuf.pageslen = 1;
 
 		VERIFY(err, !init->mem);
@@ -2330,7 +2311,7 @@ static int fastrpc_device_open(struct inode *inode, struct file *filp)
 
 	if (me->pending_free) {
 		event = wait_event_interruptible_timeout(wait_queue,
-						me->pending_free, RPC_TIMEOUT);
+						!me->pending_free, RPC_TIMEOUT);
 		if (event == 0)
 			pr_err("timed out..list is still not empty\n");
 	}
@@ -2404,6 +2385,17 @@ bail:
 	return err;
 }
 
+static int fastrpc_get_info(struct fastrpc_file *fl, uint32_t *info)
+{
+	int err = 0;
+
+	VERIFY(err, fl && fl->sctx);
+	if (err)
+		goto bail;
+	*info = (fl->sctx->smmu.enabled ? 1 : 0);
+bail:
+	return err;
+}
 
 static int fastrpc_internal_control(struct fastrpc_file *fl,
 					struct fastrpc_ioctl_control *cp)
@@ -2442,6 +2434,7 @@ static long fastrpc_device_ioctl(struct file *file, unsigned int ioctl_num,
 	void *param = (char *)ioctl_param;
 	struct fastrpc_file *fl = (struct fastrpc_file *)file->private_data;
 	int size = 0, err = 0;
+	uint32_t info;
 
 	switch (ioctl_num) {
 	case FASTRPC_IOCTL_INVOKE_FD:
@@ -2492,7 +2485,7 @@ static long fastrpc_device_ioctl(struct file *file, unsigned int ioctl_num,
 		break;
 	case FASTRPC_IOCTL_CONTROL:
 		K_COPY_FROM_USER(err, 0, &p.cp, param,
-				sizeof(p.cp));
+				 sizeof(p.cp));
 		if (err)
 			goto bail;
 		VERIFY(err, 0 == (err = fastrpc_internal_control(fl, &p.cp)));
@@ -2504,7 +2497,15 @@ static long fastrpc_device_ioctl(struct file *file, unsigned int ioctl_num,
 				goto bail;
 		}
 		break;
-	case FASTRPC_IOCTL_INIT:
+	case FASTRPC_IOCTL_GETINFO:
+		VERIFY(err, 0 == (err = fastrpc_get_info(fl, &info)));
+		if (err)
+			goto bail;
+		VERIFY(err, 0 == copy_to_user(param, &info, sizeof(info)));
+		if (err)
+			goto bail;
+		break;
+case FASTRPC_IOCTL_INIT:
 		VERIFY(err, 0 == copy_from_user(&p.init, param,
 						sizeof(p.init)));
 		if (err)
@@ -2763,6 +2764,46 @@ static int fastrpc_probe(struct platform_device *pdev)
 			pr_err("ADSPRPC: Unable to create adsp-remoteheap ramdump device.\n");
 			me->channel[0].remoteheap_ramdump_dev = NULL;
 		}
+		range.addr = 0;
+		ion_node = of_find_compatible_node(NULL, NULL, "qcom,msm-ion");
+		if (ion_node) {
+			for_each_available_child_of_node(ion_node, node) {
+				if (of_property_read_u32(node, "reg", &val))
+					continue;
+				if (val != ION_ADSP_HEAP_ID)
+					continue;
+				ion_pdev = of_find_device_by_node(node);
+				if (!ion_pdev)
+					break;
+				cma = dev_get_cma_area(&ion_pdev->dev);
+				if (cma) {
+					range.addr = cma_get_base(cma);
+					range.size = (size_t)cma_get_size(cma);
+				}
+				break;
+			}
+		}
+		if (range.addr) {
+			int srcVM[1] = {VMID_HLOS};
+			int destVM[4] = {VMID_HLOS, VMID_MSS_MSA, VMID_SSC_Q6,
+					VMID_ADSP_Q6};
+			int destVMperm[4] = {PERM_READ | PERM_WRITE | PERM_EXEC,
+					PERM_READ | PERM_WRITE | PERM_EXEC,
+					PERM_READ | PERM_WRITE | PERM_EXEC,
+					PERM_READ | PERM_WRITE | PERM_EXEC,
+					};
+
+			VERIFY(err, !hyp_assign_phys(range.addr, range.size,
+					srcVM, 1, destVM, destVMperm, 4));
+			if (err)
+				goto bail;
+		}
+		return 0;
+	}
+
+	if (of_device_is_compatible(dev->of_node,
+					"qcom,msm-mdsprpc-mem-region")) {
+		me->modem_cma_dev = dev;
 		return 0;
 	}
 

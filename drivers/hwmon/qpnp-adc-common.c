@@ -1607,6 +1607,34 @@ int32_t qpnp_adc_scale_pmi_chg_temp(struct qpnp_vadc_chip *vadc,
 }
 EXPORT_SYMBOL(qpnp_adc_scale_pmi_chg_temp);
 
+int32_t qpnp_adc_scale_mpp_therm_temp(struct qpnp_vadc_chip *vadc,
+		int32_t adc_code,
+		const struct qpnp_adc_properties *adc_properties,
+		const struct qpnp_vadc_chan_properties *chan_properties,
+		struct qpnp_vadc_result *adc_chan_result)
+{
+	int rc = 0;
+	int64_t bat_voltage = 0;
+
+	rc = qpnp_adc_scale_default(vadc, adc_code, adc_properties,
+			chan_properties, adc_chan_result);
+	if (rc < 0)
+		return rc;
+	pr_err("raw_code:%x, v_adc:%lld\n", adc_code,
+						adc_chan_result->physical);
+
+
+	bat_voltage =  (adc_chan_result->physical)/1000;
+
+	return qpnp_adc_map_temp_voltage(
+			adcmap_btm_threshold,
+			ARRAY_SIZE(adcmap_btm_threshold),
+			bat_voltage,
+			&adc_chan_result->physical);
+}
+EXPORT_SYMBOL(qpnp_adc_scale_mpp_therm_temp);
+
+
 int32_t qpnp_adc_enable_voltage(struct qpnp_adc_drv *adc)
 {
 	int rc = 0;

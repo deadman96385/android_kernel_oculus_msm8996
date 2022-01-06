@@ -15,6 +15,7 @@
 #include <linux/hash.h>
 #include "hfi_packetization.h"
 #include "msm_vidc_debug.h"
+#include "vidc_profile.h"
 
 /* Set up look-up tables to convert HAL_* to HFI_*.
  *
@@ -369,6 +370,27 @@ int create_pkt_cmd_sys_debug_config(
 	if (msm_vidc_fw_debug_mode
 			<= (HFI_DEBUG_MODE_QUEUE | HFI_DEBUG_MODE_QDSS))
 		hfi->debug_mode = msm_vidc_fw_debug_mode;
+	return 0;
+}
+
+int create_pkt_cmd_sys_feature_config_packet(
+	struct hfi_cmd_sys_set_property_packet *pkt)
+{
+	struct hfi_feature_config *hfi;
+
+	if (!pkt)
+		return -EINVAL;
+
+	pkt->size = sizeof(struct hfi_cmd_sys_set_property_packet) +
+		sizeof(struct hfi_feature_config) + sizeof(u32);
+	pkt->packet_type = HFI_CMD_SYS_SET_PROPERTY;
+	pkt->num_properties = 1;
+	pkt->rg_property_data[0] = HFI_PROPERTY_SYS_FEATURE_CONFIG;
+
+	hfi = (struct hfi_feature_config *) &pkt->rg_property_data[1];
+	hfi->enable_maxdec_resolution = 1;
+	hfi->enable_maxenc_resolution = 0;
+	hfi->reserved = 0;
 	return 0;
 }
 
@@ -869,6 +891,8 @@ int create_pkt_cmd_session_etb_decoder(
 	pkt->input_tag = input_frame->clnt_data;
 	pkt->packet_buffer = (u32)input_frame->device_addr;
 
+	rc = vidc_profile_start(session, input_frame->timestamp);
+
 	trace_msm_v4l2_vidc_buffer_event_start("ETB",
 		input_frame->device_addr, input_frame->timestamp,
 		input_frame->alloc_len, input_frame->filled_len,
@@ -903,6 +927,8 @@ int create_pkt_cmd_session_etb_encoder(
 	pkt->input_tag = input_frame->clnt_data;
 	pkt->packet_buffer = (u32)input_frame->device_addr;
 	pkt->extra_data_buffer = (u32)input_frame->extradata_addr;
+
+	rc = vidc_profile_start(session, input_frame->timestamp);
 
 	trace_msm_v4l2_vidc_buffer_event_start("ETB",
 		input_frame->device_addr, input_frame->timestamp,
@@ -2454,6 +2480,7 @@ static struct hfi_packetization_ops hfi_default = {
 	.sys_power_control = create_pkt_cmd_sys_power_control,
 	.sys_set_resource = create_pkt_cmd_sys_set_resource,
 	.sys_debug_config = create_pkt_cmd_sys_debug_config,
+	.sys_feature_config = create_pkt_cmd_sys_feature_config_packet,
 	.sys_coverage_config = create_pkt_cmd_sys_coverage_config,
 	.sys_release_resource = create_pkt_cmd_sys_release_resource,
 	.sys_ping = create_pkt_cmd_sys_ping,

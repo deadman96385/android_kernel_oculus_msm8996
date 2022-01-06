@@ -17,6 +17,7 @@
 #include <linux/idr.h>
 #include <linux/pm_qos.h>
 #include <linux/sched.h>
+#include <linux/kthread.h>
 
 #include "kgsl.h"
 #include "kgsl_mmu.h"
@@ -26,6 +27,7 @@
 #include "kgsl_snapshot.h"
 #include "kgsl_sharedmem.h"
 #include "kgsl_cmdbatch.h"
+#include "kgsl_threadstats.h"
 
 #include <linux/sync.h>
 
@@ -239,7 +241,7 @@ struct kgsl_device {
 	struct completion hwaccess_gate;
 	struct completion cmdbatch_gate;
 	const struct kgsl_functable *ftbl;
-	struct work_struct idle_check_ws;
+	struct kthread_work idle_check_work;
 	struct timer_list idle_timer;
 	struct kgsl_pwrctrl pwrctrl;
 	int open_count;
@@ -295,7 +297,7 @@ struct kgsl_device {
 #define KGSL_DEVICE_COMMON_INIT(_dev) \
 	.hwaccess_gate = COMPLETION_INITIALIZER((_dev).hwaccess_gate),\
 	.cmdbatch_gate = COMPLETION_INITIALIZER((_dev).cmdbatch_gate),\
-	.idle_check_ws = __WORK_INITIALIZER((_dev).idle_check_ws,\
+	.idle_check_work = KTHREAD_WORK_INIT((_dev).idle_check_work,\
 			kgsl_idle_check),\
 	.context_idr = IDR_INIT((_dev).context_idr),\
 	.wait_queue = __WAIT_QUEUE_HEAD_INITIALIZER((_dev).wait_queue),\
@@ -324,6 +326,7 @@ enum kgsl_context_priv {
 };
 
 struct kgsl_process_private;
+struct kgsl_thread_private;
 
 /**
  * struct kgsl_context - The context fields that are valid for a user defined
@@ -346,6 +349,7 @@ struct kgsl_process_private;
  * @pwr_constraint: power constraint from userspace for this context
  * @fault_count: number of times gpu hanged in last _context_throttle_time ms
  * @fault_time: time of the first gpu hang in last _context_throttle_time ms
+ * @node: list node for context_list in kgsl_process_private
  */
 struct kgsl_context {
 	struct kref refcount;
@@ -354,6 +358,7 @@ struct kgsl_context {
 	pid_t tid;
 	struct kgsl_device_private *dev_priv;
 	struct kgsl_process_private *proc_priv;
+	struct kgsl_thread_private *thread_priv;
 	unsigned long priv;
 	struct kgsl_device *device;
 	unsigned int reset_status;
@@ -363,6 +368,7 @@ struct kgsl_context {
 	struct kgsl_pwr_constraint pwr_constraint;
 	unsigned int fault_count;
 	unsigned long fault_time;
+	struct list_head node;
 };
 
 #define _context_comm(_c) \
@@ -394,6 +400,7 @@ struct kgsl_context {
  * @syncsource_idr: sync sources created by this process
  * @syncsource_lock: Spinlock to protect the syncsource idr
  * @fd_count: Counter for the number of FDs for this process
+ * @context_list: List of high priority contexts allocated by this process
  */
 struct kgsl_process_private {
 	unsigned long priv;
@@ -413,6 +420,24 @@ struct kgsl_process_private {
 	struct idr syncsource_idr;
 	spinlock_t syncsource_lock;
 	int fd_count;
+	struct list_head context_list;
+	rwlock_t context_list_lock;
+};
+
+struct kgsl_thread_private {
+	struct list_head list;
+	struct kobject kobj;
+	struct kref refcount;
+
+	pid_t tid;
+	char comm[TASK_COMM_LEN];
+	int fd_count;
+
+	uint64_t sync_ktime;
+	uint64_t sync_ticks;
+
+	uint64_t stats[KGSL_THREADSTATS_MAX];
+	struct kernfs_node *event_sd[KGSL_THREADSTATS_MAX];
 };
 
 /**
@@ -678,6 +703,14 @@ static inline bool kgsl_context_invalid(struct kgsl_context *context)
 						&context->priv));
 }
 
+/**
+ * kgsl_context_high_priority() - check if context has elevated priority
+ * @context: the context
+ */
+static inline bool kgsl_context_high_priority(struct kgsl_context *context)
+{
+	return context->priority < KGSL_CONTEXT_PRIORITY_MED;
+}
 
 /**
  * kgsl_context_get() - get a pointer to a KGSL context

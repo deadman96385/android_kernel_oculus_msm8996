@@ -71,6 +71,8 @@ struct kgsl_clk_stats {
 	unsigned int total;
 	unsigned int busy_old;
 	unsigned int total_old;
+	uint64_t busy_accum;
+	uint64_t total_accum;
 };
 
 struct kgsl_pwr_constraint {
@@ -218,7 +220,7 @@ struct kgsl_pwrctrl {
 int kgsl_pwrctrl_init(struct kgsl_device *device);
 void kgsl_pwrctrl_close(struct kgsl_device *device);
 void kgsl_timer(unsigned long data);
-void kgsl_idle_check(struct work_struct *work);
+void kgsl_idle_check(struct kthread_work *work);
 void kgsl_pre_hwaccess(struct kgsl_device *device);
 void kgsl_pwrctrl_pwrlevel_change(struct kgsl_device *device,
 	unsigned int level);
