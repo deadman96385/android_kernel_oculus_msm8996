@@ -492,6 +492,7 @@ static int __configure_pipe_params(struct msm_fb_data_type *mfd,
 	pipe->mfd = mfd;
 	pipe->play_cnt = 0;
 	pipe->flags = 0;
+	pipe->color_type = 0;
 
 	if (layer->flags & MDP_LAYER_FLIP_LR)
 		pipe->flags = MDP_FLIP_LR;
@@ -530,6 +531,15 @@ static int __configure_pipe_params(struct msm_fb_data_type *mfd,
 	pipe->is_handed_off = false;
 	pipe->async_update = (layer->flags & MDP_LAYER_ASYNC) ? true : false;
 	pipe->csc_coeff_set = layer->color_space;
+
+	/*
+	 * if color_type is set, only use the specified color channel; this
+	 * relies on C3_ALPHA in the unpack pattern, so we'll only do it if
+	 * we have enough channels (some 16-bit formats like RGB_565 are not
+	 * supported)
+	 */
+	if (pipe->src_fmt->unpack_count == 4)
+		pipe->color_type = layer->buffer.color_type;
 
 	if (mixer->ctl) {
 		pipe->dst.x += mixer->ctl->border_x_off;
@@ -1648,7 +1658,7 @@ static int __validate_layers(struct msm_fb_data_type *mfd,
 	u32 mixer_mux, dst_x;
 	int layer_count = commit->input_layer_cnt;
 
-	struct mdss_mdp_pipe *pipe, *tmp, *left_blend_pipe;
+	struct mdss_mdp_pipe *pipe = NULL, *tmp, *left_blend_pipe;
 	struct mdss_mdp_pipe *right_plist[MAX_PIPES_PER_LM] = {0};
 	struct mdss_mdp_pipe *left_plist[MAX_PIPES_PER_LM] = {0};
 	struct mdss_overlay_private *mdp5_data = mfd_to_mdp5_data(mfd);
@@ -2319,4 +2329,3 @@ done:
 	mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_OFF);
 	return rc;
 }
-

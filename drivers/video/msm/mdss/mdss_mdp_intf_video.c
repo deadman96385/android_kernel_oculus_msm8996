@@ -1186,16 +1186,7 @@ static int mdss_mdp_video_vfp_fps_update(struct mdss_mdp_video_ctx *ctx,
 	new_vsync_period_f0 = (vsync_period * hsync_period);
 
 	mdp_video_write(ctx, MDSS_MDP_REG_INTF_VSYNC_PERIOD_F0,
-			current_vsync_period_f0 | 0x800000);
-	if (new_vsync_period_f0 & 0x800000) {
-		mdp_video_write(ctx, MDSS_MDP_REG_INTF_VSYNC_PERIOD_F0,
 			new_vsync_period_f0);
-	} else {
-		mdp_video_write(ctx, MDSS_MDP_REG_INTF_VSYNC_PERIOD_F0,
-			new_vsync_period_f0 | 0x800000);
-		mdp_video_write(ctx, MDSS_MDP_REG_INTF_VSYNC_PERIOD_F0,
-			new_vsync_period_f0 & 0x7fffff);
-	}
 
 	pr_debug("if:%d vtotal:%d htotal:%d f0:0x%x nw_f0:0x%x\n",
 		ctx->intf_num, vsync_period, hsync_period,
@@ -1363,6 +1354,17 @@ static int mdss_mdp_video_config_fps(struct mdss_mdp_ctl *ctl, int new_fps)
 				goto end;
 			}
 
+			/*
+			 * Backlight duty-cycle is calculated based on the
+			 * number of rows, including all visible and invisible
+			 * pixels. Since the VFP has changed, backlight
+			 * duty-cycle needs to be updated.
+			 */
+			if (pdata->set_backlight) {
+				pdata->set_backlight(pdata,
+					pdata->panel_info.current_bl);
+			}
+
 			mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_ON);
 			spin_lock_irqsave(&ctx->dfps_lock, flags);
 
@@ -1405,6 +1407,11 @@ static int mdss_mdp_video_config_fps(struct mdss_mdp_ctl *ctl, int new_fps)
 				if (sctx)
 					mdss_mdp_fetch_end_config(sctx, ctl);
 			}
+
+			/*
+			 * Make sure controller setting committed
+			 */
+			wmb();
 
 			/*
 			 * MDP INTF registers support DB on targets
@@ -1676,7 +1683,9 @@ static void mdss_mdp_fetch_start_config(struct mdss_mdp_video_ctx *ctx,
 	h_total = mdss_panel_get_htotal(pinfo, true);
 
 	fetch_start = (v_total - pinfo->prg_fet) * h_total + 1;
-	fetch_enable = BIT(31);
+
+	fetch_enable = mdp_video_read(ctx, MDSS_MDP_REG_INTF_CONFIG);
+	fetch_enable |= BIT(31);
 
 	if (pinfo->dynamic_fps && (pinfo->dfps_update ==
 			DFPS_IMMEDIATE_CLK_UPDATE_MODE))
@@ -2054,6 +2063,11 @@ static void early_wakeup_dfps_update_work(struct work_struct *work)
 	pdata = ctl->panel_data;
 	pinfo = &ctl->panel_data->panel_info;
 	mfd =	ctl->mfd;
+
+	if (!pinfo->early_wakeup_dfps_update_enabled) {
+		pr_debug("%s: early wakeup update not enabled\n", __func__);
+		return;
+	}
 
 	if (!pinfo->dynamic_fps || !ctl->ops.config_fps_fnc ||
 		!pdata->panel_info.default_fps) {

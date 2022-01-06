@@ -428,6 +428,7 @@ struct mdss_dsi_ctrl_pdata {
 	int panel_mode;
 	int irq_cnt;
 	int disp_te_gpio;
+	int disp_dcdc_gpio;
 	int rst_gpio;
 	int disp_en_gpio;
 	int bklt_en_gpio;
@@ -437,6 +438,7 @@ struct mdss_dsi_ctrl_pdata {
 	int pwm_period;
 	int pwm_pmic_gpio;
 	int pwm_lpg_chan;
+	int bklt_min;
 	int bklt_max;
 	int new_fps;
 	int pwm_enabled;

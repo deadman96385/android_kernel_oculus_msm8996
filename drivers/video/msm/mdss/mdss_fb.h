@@ -237,10 +237,11 @@ struct msm_mdp_interface {
 };
 
 #define IS_CALIB_MODE_BL(mfd) (((mfd)->calib_mode) & MDSS_CALIB_MODE_BL)
-#define MDSS_BRIGHT_TO_BL(out, v, bl_max, max_bright) do {\
-				out = (2 * (v) * (bl_max) + max_bright);\
-				do_div(out, 2 * max_bright);\
-				} while (0)
+#define MDSS_BRIGHT_TO_BL(out, v, bl_min, bl_max, max_bright) do {\
+			out = (2 * (v) * (bl_max - bl_min) + max_bright);\
+			do_div(out, 2 * max_bright);\
+			out += bl_min;\
+			} while (0)
 
 struct mdss_fb_file_info {
 	struct file *file;

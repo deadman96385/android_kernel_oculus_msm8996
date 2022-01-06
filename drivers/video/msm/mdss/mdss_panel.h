@@ -608,8 +608,11 @@ struct mdss_panel_info {
 	u32 wait_cycle;
 	u32 pdest;
 	u32 brightness_max;
+	u32 current_bl;
 	u32 bl_max;
 	u32 bl_min;
+	u32 duty_cycle_numer;
+	u32 duty_cycle_denom;
 	u32 fb_num;
 	u64 clk_rate;
 	u32 clk_min;
@@ -626,6 +629,7 @@ struct mdss_panel_info {
 	int pwm_lpg_chan;
 	int pwm_period;
 	bool dynamic_fps;
+	bool early_wakeup_dfps_update_enabled;
 	bool ulps_feature_enabled;
 	bool ulps_suspend_enabled;
 	bool panel_ack_disabled;

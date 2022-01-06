@@ -189,16 +189,41 @@ static void mdss_dsi_panel_cmds_send(struct mdss_dsi_ctrl_pdata *ctrl,
 	mdss_dsi_cmdlist_put(ctrl, &cmdreq);
 }
 
+#if defined(CONFIG_PACIFIC_BOARD)
+/*
+ * Register values for the backlight controls (60Hz, 100 nits refresh rate
+ * default).
+ */
+static unsigned char lcd_pwmff[2] = {0xff, 0x25};
+static unsigned char lcd_pwm65[2] = {0x65, 0x02};
+static unsigned char lcd_pwm66[2] = {0x66, 0x36};
+static unsigned char lcd_pwm67[2] = {0x67, 0x7d};
+
+static struct dsi_cmd_desc backlight_cmd[] = {
+	{{DTYPE_DCS_WRITE1, 0, 0, 0, 0, 2}, lcd_pwmff},
+	{{DTYPE_DCS_WRITE1, 0, 0, 0, 0, 2}, lcd_pwm65},
+	{{DTYPE_DCS_WRITE1, 0, 0, 0, 0, 2}, lcd_pwm66},
+	{{DTYPE_DCS_WRITE1, 1, 0, 0, 0, 2}, lcd_pwm67}, };
+#else
 static char led_pwm1[2] = {0x51, 0x0};	/* DTYPE_DCS_WRITE1 */
 static struct dsi_cmd_desc backlight_cmd = {
 	{DTYPE_DCS_WRITE1, 1, 0, 0, 1, sizeof(led_pwm1)},
 	led_pwm1
 };
+#endif
 
 static void mdss_dsi_panel_bklt_dcs(struct mdss_dsi_ctrl_pdata *ctrl, int level)
 {
 	struct dcs_cmd_req cmdreq;
 	struct mdss_panel_info *pinfo;
+
+#if defined(CONFIG_PACIFIC_BOARD)
+	int row_count;
+	unsigned int backlight_low_rows;
+	unsigned int backlight_high_rows;
+	unsigned long backlight_numer;
+	unsigned long backlight_denom;
+#endif
 
 	pinfo = &(ctrl->panel_data.panel_info);
 	if (pinfo->dcs_cmd_by_left) {
@@ -206,6 +231,60 @@ static void mdss_dsi_panel_bklt_dcs(struct mdss_dsi_ctrl_pdata *ctrl, int level)
 			return;
 	}
 
+#if defined(CONFIG_PACIFIC_BOARD)
+	memset(&cmdreq, 0, sizeof(cmdreq));
+	cmdreq.flags = CMD_REQ_HS_MODE | CMD_REQ_COMMIT;
+
+	/*
+	 * mfulghum (5 Oct. 2017): Adding in calculations to properly set
+	 * backlight duty cycle and timing regardless of FPS settings.
+	 * Behavior under dynamic FPS is still untested as of the writing of
+	 * this comment.
+	 *
+	 * Duty cycle is controled by register 67h and each count is multiplied
+	 * by 4 rows.
+	 * DC = (lcd_pwm67[1] * 4) / #rows [including the porches &
+	 * v-pulse-width]
+	 *
+	 * The wait time before the backlight starts up is defined by the two
+	 * LSBs of 65h and all of 66h and each count is multiplied by 8 rows.
+	 * idle_time = (((lcd_pwm65[1] & 0x03) << 8 + lcd_pwm66[1]) * 8) / #rows
+	 *
+	 * Currently, the backlight is delayed as long as possible to minimize
+	 * motion artifacts. Would it be worth doing some experiments to see if
+	 * we could reduce this delay somewhat to reduce intrinsic latency that
+	 * we would otherwise have to timewarp away?
+	 *
+	 * TODO(mfulghum): Test behavior under dynamic FPS.
+	 */
+
+	/*
+	 * Gets the total number of rows, including all visible and
+	 * invisible pixels.
+	 */
+	row_count = mdss_panel_get_vtotal(pinfo);
+
+	/*
+	 * Maximum desired duty cycle is 10% which results in 100 nits
+	 * from factory cal.
+	 */
+	backlight_numer = (unsigned long)(level * row_count) *
+		(unsigned long)pinfo->duty_cycle_numer;
+	backlight_denom = (unsigned long)ctrl->bklt_max *
+		(unsigned long)pinfo->duty_cycle_denom;
+	backlight_high_rows = (unsigned int)(backlight_numer / backlight_denom);
+	backlight_low_rows = row_count - backlight_high_rows;
+
+	/* VSOUTS[9:0] */
+	lcd_pwm65[1] = (backlight_low_rows >> 11) & 0x03;
+	lcd_pwm66[1] = (backlight_low_rows >> 3) & 0xFF;
+
+	/* VSOUTW[7:0] */
+	lcd_pwm67[1] = (backlight_high_rows >> 2) & 0xFF;
+
+	cmdreq.cmds = backlight_cmd;
+	cmdreq.cmds_cnt = sizeof(backlight_cmd) / sizeof(backlight_cmd[0]);
+#else
 	pr_debug("%s: level=%d\n", __func__, level);
 
 	led_pwm1[1] = (unsigned char)level;
@@ -214,10 +293,13 @@ static void mdss_dsi_panel_bklt_dcs(struct mdss_dsi_ctrl_pdata *ctrl, int level)
 	cmdreq.cmds = &backlight_cmd;
 	cmdreq.cmds_cnt = 1;
 	cmdreq.flags = CMD_REQ_COMMIT | CMD_CLK_CTRL;
+#endif
 	cmdreq.rlen = 0;
 	cmdreq.cb = NULL;
 
 	mdss_dsi_cmdlist_put(ctrl, &cmdreq);
+
+	pinfo->current_bl = level;
 }
 
 static int mdss_dsi_request_gpios(struct mdss_dsi_ctrl_pdata *ctrl_pdata)
@@ -256,8 +338,19 @@ static int mdss_dsi_request_gpios(struct mdss_dsi_ctrl_pdata *ctrl_pdata)
 			goto mode_gpio_err;
 		}
 	}
-	return rc;
+	if (gpio_is_valid(ctrl_pdata->disp_dcdc_gpio)) {
+		rc = gpio_request(ctrl_pdata->disp_dcdc_gpio,
+						"disp_dcdc_gpio");
+		if (rc) {
+			pr_err("request bklt gpio failed, rc=%d\n",
+				       rc);
+			goto disp_dcdc_gpio_err;
+		}
+	}
 
+	return rc;
+disp_dcdc_gpio_err:
+	gpio_free(ctrl_pdata->disp_dcdc_gpio);
 mode_gpio_err:
 	if (gpio_is_valid(ctrl_pdata->bklt_en_gpio))
 		gpio_free(ctrl_pdata->bklt_en_gpio);
@@ -349,6 +442,15 @@ int mdss_dsi_panel_reset(struct mdss_panel_data *pdata, int enable)
 					goto exit;
 				}
 			}
+			if (gpio_is_valid(ctrl_pdata->disp_dcdc_gpio)) {
+				rc = gpio_direction_output(
+					ctrl_pdata->disp_dcdc_gpio, 1);
+				if (rc) {
+					pr_err("%s: unable to set dir for dcdc gpio\n",
+						__func__);
+					goto exit;
+				}
+			}
 		}
 
 		if (gpio_is_valid(ctrl_pdata->mode_gpio)) {
@@ -373,6 +475,10 @@ int mdss_dsi_panel_reset(struct mdss_panel_data *pdata, int enable)
 			pr_debug("%s: Reset panel done\n", __func__);
 		}
 	} else {
+		if (gpio_is_valid(ctrl_pdata->disp_dcdc_gpio)) {
+			gpio_set_value((ctrl_pdata->disp_dcdc_gpio), 0);
+			gpio_free(ctrl_pdata->disp_dcdc_gpio);
+		}
 		if (gpio_is_valid(ctrl_pdata->bklt_en_gpio)) {
 			gpio_set_value((ctrl_pdata->bklt_en_gpio), 0);
 			gpio_free(ctrl_pdata->bklt_en_gpio);
@@ -1996,6 +2102,10 @@ static void mdss_dsi_parse_dfps_config(struct device_node *pan_node,
 		return;
 
 	pinfo->dynamic_fps = true;
+	pinfo->early_wakeup_dfps_update_enabled =
+		!of_property_read_bool(pan_node,
+			"qcom,mdss-dsi-pan-disable-early-wakeup-dfps-update");
+
 	data = of_get_property(pan_node, "qcom,mdss-dsi-pan-fps-update", NULL);
 	if (data) {
 		if (!strcmp(data, "dfps_suspend_resume_mode")) {
@@ -2426,10 +2536,33 @@ static int mdss_panel_parse_dt(struct device_node *np,
 			pinfo->panel_orientation = MDP_FLIP_UD;
 	}
 
+	rc = of_property_read_u32(np, "qcom,mdss-dsi-duty-cycle-percentage",
+		&tmp);
+	if (!rc) {
+		/* Default path for qcom backlight settings */
+		pinfo->duty_cycle_numer = tmp;
+		pinfo->duty_cycle_denom = 100;
+	} else {
+		/* Allow for finer-grained control of backlight DC */
+		rc = of_property_read_u32(np,
+			"oculus,bklt-duty-cycle-numerator", &tmp);
+		pinfo->duty_cycle_numer = (!rc ? tmp : 10);
+		rc = of_property_read_u32(np,
+			"oculus,bklt-duty-cycle-denominator", &tmp);
+		pinfo->duty_cycle_denom = (!rc ? tmp : 100);
+	}
+
+	/* Clamp values to 0-20% DC as a sanity check */
+	if (pinfo->duty_cycle_denom < 100)
+		pinfo->duty_cycle_denom = 100;
+	if (pinfo->duty_cycle_numer > (2 * pinfo->duty_cycle_denom) / 10)
+		pinfo->duty_cycle_numer = (2 * pinfo->duty_cycle_denom) / 10;
+
 	rc = of_property_read_u32(np, "qcom,mdss-brightness-max-level", &tmp);
 	pinfo->brightness_max = (!rc ? tmp : MDSS_MAX_BL_BRIGHTNESS);
 	rc = of_property_read_u32(np, "qcom,mdss-dsi-bl-min-level", &tmp);
 	pinfo->bl_min = (!rc ? tmp : 0);
+	ctrl_pdata->bklt_min = pinfo->bl_min;
 	rc = of_property_read_u32(np, "qcom,mdss-dsi-bl-max-level", &tmp);
 	pinfo->bl_max = (!rc ? tmp : 255);
 	ctrl_pdata->bklt_max = pinfo->bl_max;

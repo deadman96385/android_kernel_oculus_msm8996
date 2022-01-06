@@ -38,6 +38,7 @@
 
 #define DRV_NAME "hdmi-tx"
 #define COMPATIBLE_NAME "qcom,hdmi-tx"
+#define REDRIVER_EN_NAME COMPATIBLE_NAME "-redriver-en"
 
 #define HDMI_TX_EVT_STR(x) #x
 #define DEFAULT_VIDEO_RESOLUTION HDMI_VFRMT_640x480p60_4_3
@@ -268,6 +269,8 @@ static bool hdmi_tx_is_cea_format(int mode)
 	bool cea_fmt;
 
 	if ((mode > 0) && (mode <= HDMI_EVFRMT_END))
+		cea_fmt = true;
+	else if ((mode >= HDMI_VFRMT_RESERVE1) && (mode <= RESERVE_VFRMT_END))
 		cea_fmt = true;
 	else
 		cea_fmt = false;
@@ -2559,6 +2562,13 @@ error:
 	return rc;
 } /* hdmi_tx_enable_power */
 
+static void hdmi_tx_enable_redriver(struct hdmi_tx_platform_data *pdata,
+	bool enable)
+{
+	if (pdata->redriver_en >= 0)
+		gpio_set_value(pdata->redriver_en, !enable);
+}
+
 static void hdmi_tx_core_off(struct hdmi_tx_ctrl *hdmi_ctrl)
 {
 	if (!hdmi_ctrl) {
@@ -2566,6 +2576,7 @@ static void hdmi_tx_core_off(struct hdmi_tx_ctrl *hdmi_ctrl)
 		return;
 	}
 
+	hdmi_tx_enable_redriver(&hdmi_ctrl->pdata, false);
 	hdmi_tx_enable_power(hdmi_ctrl, HDMI_TX_CEC_PM, 0);
 	hdmi_tx_enable_power(hdmi_ctrl, HDMI_TX_CORE_PM, 0);
 } /* hdmi_tx_core_off */
@@ -2578,6 +2589,8 @@ static int hdmi_tx_core_on(struct hdmi_tx_ctrl *hdmi_ctrl)
 		DEV_ERR("%s: invalid input\n", __func__);
 		return -EINVAL;
 	}
+
+	hdmi_tx_enable_redriver(&hdmi_ctrl->pdata, true);
 
 	rc = hdmi_tx_enable_power(hdmi_ctrl, HDMI_TX_CORE_PM, 1);
 	if (rc) {
@@ -4183,6 +4196,48 @@ error:
 	return rc;
 } /* hdmi_tx_get_dt_vreg_data */
 
+static int hdmi_tx_get_dt_redriver(struct device *dev)
+{
+	struct device_node *of_node = dev->of_node;
+	int redriver_en, rc;
+
+	if (!of_find_property(of_node, REDRIVER_EN_NAME, NULL))
+		return -ENOSYS;
+
+	redriver_en = of_get_named_gpio(of_node, REDRIVER_EN_NAME, 0);
+	if (redriver_en < 0) {
+		DEV_ERR("%s: get_named_gpio '%s' failed\n", __func__,
+			REDRIVER_EN_NAME);
+		return -EINVAL;
+	}
+
+	rc = gpio_request(redriver_en, REDRIVER_EN_NAME);
+	if (rc < 0) {
+		DEV_ERR("%s: gpio_request %d '%s' failed\n", __func__,
+			redriver_en, REDRIVER_EN_NAME);
+		return -EIO;
+	}
+
+	rc = gpio_direction_output(redriver_en, 1);
+	if (rc < 0) {
+		DEV_ERR("%s: gpio_direction_output %d '%s' failed\n", __func__,
+			redriver_en, REDRIVER_EN_NAME);
+		gpio_free(redriver_en);
+		return -EIO;
+	}
+
+	return redriver_en;
+}
+
+static void hdmi_tx_put_dt_redriver(struct device *dev,
+	struct hdmi_tx_platform_data *pdata)
+{
+	if (pdata->redriver_en >= 0) {
+		gpio_free(pdata->redriver_en);
+		pdata->redriver_en = -ENOSYS;
+	}
+}
+
 static void hdmi_tx_put_dt_gpio_data(struct device *dev,
 	struct dss_module_power *module_power)
 {
@@ -4300,6 +4355,8 @@ static void hdmi_tx_put_dt_data(struct device *dev,
 
 	for (i = HDMI_TX_MAX_PM - 1; i >= 0; i--)
 		hdmi_tx_put_dt_gpio_data(dev, &pdata->power_data[i]);
+
+	hdmi_tx_put_dt_redriver(dev, pdata);
 } /* hdmi_tx_put_dt_data */
 
 static int hdmi_tx_get_dt_data(struct platform_device *pdev,
@@ -4357,6 +4414,8 @@ static int hdmi_tx_get_dt_data(struct platform_device *pdev,
 			goto error;
 		}
 	}
+
+	pdata->redriver_en = hdmi_tx_get_dt_redriver(&pdev->dev);
 
 	if (!hdmi_ctrl->pdata.primary)
 		hdmi_ctrl->pdata.primary = of_property_read_bool(

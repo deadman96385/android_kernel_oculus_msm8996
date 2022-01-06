@@ -273,8 +273,9 @@ static void mdss_fb_set_bl_brightness(struct led_classdev *led_cdev,
 
 	/* This maps android backlight level 0 to 255 into
 	   driver backlight level 0 to bl_max with rounding */
-	MDSS_BRIGHT_TO_BL(bl_lvl, value, mfd->panel_info->bl_max,
-				mfd->panel_info->brightness_max);
+	MDSS_BRIGHT_TO_BL(bl_lvl, value,
+		mfd->panel_info->bl_min, mfd->panel_info->bl_max,
+		mfd->panel_info->brightness_max);
 
 	if (!bl_lvl && value)
 		bl_lvl = 1;
@@ -782,6 +783,188 @@ static ssize_t mdss_fb_get_dfps_mode(struct device *dev,
 	return ret;
 }
 
+static ssize_t mdss_fb_get_duty_cycle(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	struct fb_info *fbi = dev_get_drvdata(dev);
+	struct msm_fb_data_type *mfd = (struct msm_fb_data_type *)fbi->par;
+	struct mdss_panel_data *pdata;
+	struct mdss_panel_info *pinfo;
+	int ret;
+
+	pdata = dev_get_platdata(&mfd->pdev->dev);
+	if (!pdata) {
+		pr_err("no panel connected!\n");
+		return -EINVAL;
+	}
+	pinfo = &pdata->panel_info;
+
+	/* Replicate default behavior with numer/denom nodes */
+	ret = scnprintf(buf, PAGE_SIZE, "%d",
+		(pinfo->duty_cycle_numer * 100) / pinfo->duty_cycle_denom);
+
+	return ret;
+}
+
+static ssize_t mdss_fb_set_duty_cycle(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct fb_info *fbi = dev_get_drvdata(dev);
+	struct msm_fb_data_type *mfd = fbi->par;
+	struct mdss_panel_data *pdata;
+	struct mdss_panel_info *pinfo;
+	int rc = 0;
+	int duty_cycle = 0;
+
+	pdata = dev_get_platdata(&mfd->pdev->dev);
+	if (!pdata) {
+		pr_err("no panel connected!\n");
+		return -EINVAL;
+	}
+	pinfo = &pdata->panel_info;
+
+	rc = kstrtouint(buf, 10, &duty_cycle);
+	if (rc) {
+		pr_err("kstrtouint failed. rc=%d\n", rc);
+		return rc;
+	}
+
+	if (duty_cycle > 100) {
+		pr_err("invalid duty cycle (%d)\n", duty_cycle);
+		return -EINVAL;
+	}
+
+	/*
+	 * Refresh the backlight, replicating default behavior with
+	 * numer/denom nodes
+	 */
+	mutex_lock(&mfd->bl_lock);
+	pinfo->duty_cycle_numer = (duty_cycle * pinfo->duty_cycle_denom) / 100;
+	pdata->set_backlight(pdata, pinfo->current_bl);
+	mutex_unlock(&mfd->bl_lock);
+
+	return count;
+}
+
+static ssize_t mdss_fb_get_duty_cycle_numer(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	struct fb_info *fbi = dev_get_drvdata(dev);
+	struct msm_fb_data_type *mfd = (struct msm_fb_data_type *)fbi->par;
+	struct mdss_panel_data *pdata;
+	struct mdss_panel_info *pinfo;
+	int ret;
+
+	pdata = dev_get_platdata(&mfd->pdev->dev);
+	if (!pdata) {
+		pr_err("no panel connected!\n");
+		return -EINVAL;
+	}
+	pinfo = &pdata->panel_info;
+
+	ret = scnprintf(buf, PAGE_SIZE, "%d",
+		(int) pinfo->duty_cycle_numer);
+
+	return ret;
+}
+
+static ssize_t mdss_fb_set_duty_cycle_numer(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct fb_info *fbi = dev_get_drvdata(dev);
+	struct msm_fb_data_type *mfd = fbi->par;
+	struct mdss_panel_data *pdata;
+	struct mdss_panel_info *pinfo;
+	int rc = 0;
+	u32 duty_cycle_numer = 0;
+
+	pdata = dev_get_platdata(&mfd->pdev->dev);
+	if (!pdata) {
+		pr_err("no panel connected!\n");
+		return -EINVAL;
+	}
+	pinfo = &pdata->panel_info;
+
+	rc = kstrtouint(buf, 10, &duty_cycle_numer);
+	if (rc) {
+		pr_err("kstrtouint failed. rc=%d\n", rc);
+		return rc;
+	}
+
+	/* Clamp values to 0-20% DC as a sanity check */
+	if (duty_cycle_numer > (2 * pinfo->duty_cycle_denom) / 10) {
+		pr_err("invalid duty cycle (%d/%d): must be 0-20%%\n",
+			duty_cycle_numer, pinfo->duty_cycle_denom);
+		return -EINVAL;
+	}
+
+	/* Refresh the backlight. */
+	mutex_lock(&mfd->bl_lock);
+	pinfo->duty_cycle_numer = duty_cycle_numer;
+	pdata->set_backlight(pdata, pinfo->current_bl);
+	mutex_unlock(&mfd->bl_lock);
+
+	return count;
+}
+
+static ssize_t mdss_fb_get_duty_cycle_denom(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	struct fb_info *fbi = dev_get_drvdata(dev);
+	struct msm_fb_data_type *mfd = (struct msm_fb_data_type *)fbi->par;
+	struct mdss_panel_data *pdata;
+	struct mdss_panel_info *pinfo;
+	int ret;
+
+	pdata = dev_get_platdata(&mfd->pdev->dev);
+	if (!pdata) {
+		pr_err("no panel connected!\n");
+		return -EINVAL;
+	}
+	pinfo = &pdata->panel_info;
+
+	ret = scnprintf(buf, PAGE_SIZE, "%d",
+		(int) pinfo->duty_cycle_denom);
+
+	return ret;
+}
+
+static ssize_t mdss_fb_set_duty_cycle_denom(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct fb_info *fbi = dev_get_drvdata(dev);
+	struct msm_fb_data_type *mfd = fbi->par;
+	struct mdss_panel_data *pdata;
+	struct mdss_panel_info *pinfo;
+	int rc = 0;
+	u32 duty_cycle_denom = 0;
+
+	pdata = dev_get_platdata(&mfd->pdev->dev);
+	if (!pdata) {
+		pr_err("no panel connected!\n");
+		return -EINVAL;
+	}
+	pinfo = &pdata->panel_info;
+
+	rc = kstrtouint(buf, 10, &duty_cycle_denom);
+	if (rc) {
+		pr_err("kstrtouint failed. rc=%d\n", rc);
+		return rc;
+	}
+
+	if (duty_cycle_denom < 100) {
+		pr_err("invalid duty cycle denominator (%d): must be >= 100\n",
+			duty_cycle_denom);
+		return -EINVAL;
+	}
+
+	mutex_lock(&mfd->bl_lock);
+	pinfo->duty_cycle_denom = duty_cycle_denom;
+	mutex_unlock(&mfd->bl_lock);
+
+	return count;
+}
+
 static DEVICE_ATTR(msm_fb_type, S_IRUGO, mdss_fb_get_type, NULL);
 static DEVICE_ATTR(msm_fb_split, S_IRUGO | S_IWUSR, mdss_fb_show_split,
 					mdss_fb_store_split);
@@ -798,6 +981,12 @@ static DEVICE_ATTR(msm_fb_panel_status, S_IRUGO | S_IWUSR,
 	mdss_fb_get_panel_status, mdss_fb_force_panel_dead);
 static DEVICE_ATTR(msm_fb_dfps_mode, S_IRUGO | S_IWUSR,
 	mdss_fb_get_dfps_mode, mdss_fb_change_dfps_mode);
+static DEVICE_ATTR(msm_fb_duty_cycle, S_IRUGO | S_IWUSR,
+	mdss_fb_get_duty_cycle, mdss_fb_set_duty_cycle);
+static DEVICE_ATTR(msm_fb_duty_cycle_numer, S_IRUGO | S_IWUSR,
+	mdss_fb_get_duty_cycle_numer, mdss_fb_set_duty_cycle_numer);
+static DEVICE_ATTR(msm_fb_duty_cycle_denom, S_IRUGO | S_IWUSR,
+	mdss_fb_get_duty_cycle_denom, mdss_fb_set_duty_cycle_denom);
 static struct attribute *mdss_fb_attrs[] = {
 	&dev_attr_msm_fb_type.attr,
 	&dev_attr_msm_fb_split.attr,
@@ -809,6 +998,9 @@ static struct attribute *mdss_fb_attrs[] = {
 	&dev_attr_msm_fb_thermal_level.attr,
 	&dev_attr_msm_fb_panel_status.attr,
 	&dev_attr_msm_fb_dfps_mode.attr,
+	&dev_attr_msm_fb_duty_cycle.attr,
+	&dev_attr_msm_fb_duty_cycle_numer.attr,
+	&dev_attr_msm_fb_duty_cycle_denom.attr,
 	NULL,
 };
 
@@ -1127,7 +1319,8 @@ static int mdss_fb_probe(struct platform_device *pdev)
 	mfd->ext_ad_ctrl = -1;
 	if (mfd->panel_info && mfd->panel_info->brightness_max > 0)
 		MDSS_BRIGHT_TO_BL(mfd->bl_level, backlight_led.brightness,
-		mfd->panel_info->bl_max, mfd->panel_info->brightness_max);
+			mfd->panel_info->bl_min, mfd->panel_info->bl_max,
+			mfd->panel_info->brightness_max);
 	else
 		mfd->bl_level = 0;
 
@@ -3201,7 +3394,7 @@ int mdss_fb_atomic_commit(struct fb_info *info,
 	struct mdp_layer_commit_v1 *commit_v1;
 	struct mdp_output_layer *output_layer;
 	struct mdss_panel_info *pinfo;
-	bool wait_for_finish, wb_change = false;
+	bool wait_for_finish, update = false, wb_change = false;
 	int ret = -EPERM;
 	u32 old_xres, old_yres, old_format;
 
@@ -3253,6 +3446,7 @@ int mdss_fb_atomic_commit(struct fb_info *info,
 						output_layer->buffer.width,
 						output_layer->buffer.height,
 						output_layer->buffer.format);
+					update = true;
 				}
 			}
 			ret = mfd->mdp.atomic_validate(mfd, file, commit_v1);
@@ -3293,7 +3487,7 @@ int mdss_fb_atomic_commit(struct fb_info *info,
 		ret = mdss_fb_pan_idle(mfd);
 
 end:
-	if (ret && (mfd->panel.type == WRITEBACK_PANEL) && wb_change)
+	if (update && ret && (mfd->panel.type == WRITEBACK_PANEL) && wb_change)
 		mdss_fb_update_resolution(mfd, old_xres, old_yres, old_format);
 	return ret;
 }
@@ -4589,7 +4783,7 @@ static bool check_not_supported_ioctl(u32 cmd)
 {
 	return((cmd == MSMFB_OVERLAY_SET) || (cmd == MSMFB_OVERLAY_UNSET) ||
 		(cmd == MSMFB_OVERLAY_GET) || (cmd == MSMFB_OVERLAY_PREPARE) ||
-		(cmd == MSMFB_DISPLAY_COMMIT) || (cmd == MSMFB_OVERLAY_PLAY) ||
+		(cmd == MSMFB_OVERLAY_PLAY) ||
 		(cmd == MSMFB_BUFFER_SYNC) || (cmd == MSMFB_OVERLAY_QUEUE) ||
 		(cmd == MSMFB_NOTIFY_UPDATE));
 }
