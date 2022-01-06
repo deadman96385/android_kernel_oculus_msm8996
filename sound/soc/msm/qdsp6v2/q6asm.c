@@ -1404,8 +1404,8 @@ static int32_t q6asm_srvc_callback(struct apr_client_data *data, void *priv)
 	uint32_t dir = 0;
 	uint32_t i = IN;
 	uint32_t *payload;
-	unsigned long dsp_flags;
-	unsigned long flags;
+	unsigned long dsp_flags = 0;
+	unsigned long flags = 0;
 	struct asm_buffer_node *buf_node = NULL;
 	struct list_head *ptr, *next;
 
@@ -1528,6 +1528,9 @@ static int32_t q6asm_srvc_callback(struct apr_client_data *data, void *priv)
 	dir = (data->token & 0x0F);
 	if (dir != IN && dir != OUT) {
 		pr_err("%s: Invalid audio port index: %d\n", __func__, dir);
+		if ((sid > 0 && sid <= SESSION_MAX))
+			spin_unlock_irqrestore(
+				&(session[sid].session_lock), flags);
 		return 0;
 	}
 	port = &ac->port[dir];
@@ -1775,31 +1778,32 @@ static int32_t q6asm_callback(struct apr_client_data *data, void *priv)
 		case ASM_SESSION_CMD_REGISTER_FOR_RX_UNDERFLOW_EVENTS:
 		case ASM_STREAM_CMD_OPEN_WRITE_COMPRESSED:
 			if (data->payload_size >=
-				2 * sizeof(uint32_t) &&
-				payload[1] != 0) {
-				pr_debug("%s: session %d opcode 0x%x token 0x%x Payload = [0x%x] stat 0x%x src %d dest %d\n",
-					__func__, ac->session,
-					data->opcode, data->token,
-					payload[0], payload[1],
-					data->src_port, data->dest_port);
-				pr_err("%s: cmd = 0x%x returned error = 0x%x\n",
-					__func__,
-					payload[0],
-					payload[1]);
-				if (wakeup_flag) {
-					if (payload[0] ==
-						ASM_STREAM_CMD_SET_PP_PARAMS_V2)
-						atomic_set(&ac->cmd_state_pp,
+				2 * sizeof(uint32_t)) {
+				if (payload[1] != 0) {
+					pr_debug("%s: session %d opcode 0x%x token 0x%x Payload = [0x%x] stat 0x%x src %d dest %d\n",
+						__func__, ac->session,
+						data->opcode, data->token,
+						payload[0], payload[1],
+						data->src_port, data->dest_port);
+					pr_err("%s: cmd = 0x%x returned error = 0x%x\n",
+						__func__,
+						payload[0],
+						payload[1]);
+					if (wakeup_flag) {
+						if (payload[0] ==
+							ASM_STREAM_CMD_SET_PP_PARAMS_V2)
+							atomic_set(&ac->cmd_state_pp,
 								payload[1]);
-					else
-						atomic_set(&ac->cmd_state,
+						else
+							atomic_set(&ac->cmd_state,
 								payload[1]);
-					wake_up(&ac->cmd_wait);
+						wake_up(&ac->cmd_wait);
+					}
+					spin_unlock_irqrestore(
+						&(session[session_id].session_lock),
+						flags);
+					return 0;
 				}
-				spin_unlock_irqrestore(
-					&(session[session_id].session_lock),
-					flags);
-				return 0;
 			} else {
 				pr_err("%s: payload size of %x is less than expected.\n",
 					__func__, data->payload_size);
@@ -2703,8 +2707,6 @@ static int __q6asm_open_write(struct audio_client *ac, uint32_t format,
 	open.bits_per_sample = bits_per_sample;
 
 	open.postprocopo_id = q6asm_get_asm_topology_cal();
-	if (ac->perf_mode != LEGACY_PCM_MODE)
-		open.postprocopo_id = ASM_STREAM_POSTPROCOPO_ID_NONE;
 
 	pr_debug("%s: perf_mode %d asm_topology 0x%x bps %d\n", __func__,
 		 ac->perf_mode, open.postprocopo_id, open.bits_per_sample);
@@ -7568,7 +7570,7 @@ int q6asm_get_apr_service_id(int session_id)
 
 int q6asm_get_asm_topology(int session_id)
 {
-	int topology;
+	int topology = 0;
 
 	if (session_id <= 0 || session_id > SESSION_MAX) {
 		pr_err("%s: invalid session_id = %d\n", __func__, session_id);
@@ -7587,7 +7589,7 @@ done:
 
 int q6asm_get_asm_app_type(int session_id)
 {
-	int app_type;
+	int app_type = DEFAULT_APP_TYPE;
 
 	if (session_id <= 0 || session_id > SESSION_MAX) {
 		pr_err("%s: invalid session_id = %d\n", __func__, session_id);

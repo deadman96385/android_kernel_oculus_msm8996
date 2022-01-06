@@ -88,6 +88,20 @@ config SND_SOC_CPE
 	 The configuration includes the cpe lsm driver to enable
 	 listen on codec.
 
+config SPEAKER_EXT_PA
+	bool "External amplifier support"
+	depends on SND_SOC_MSM8996
+	default n
+	help
+	  Enable support for external speaker amplifier.
+
+config EXT_PA_BOOST_5V
+	bool "Enable 5V boost"
+	depends on SPEAKER_EXT_PA
+	default y
+	help
+	  Use 5V boost for external power amplifier.
+
 config SND_SOC_APQ8084
 	tristate "SoC Machine driver for APQ8084 boards"
 	depends on ARCH_APQ8084
@@ -120,7 +134,7 @@ config SND_SOC_MSM8994
 	select MSM_QDSP6_APRV2
 	select MSM_QDSP6V2_CODECS
 	select SND_SOC_WCD9330
-	select SND_SOC_MSM_HDMI_CODEC_RX
+	select SND_SOC_MSM_HDMI_CODEC_RX if FB_MSM_MDSS_HDMI_PANEL
 	select QTI_PP
 	select DTS_SRS_TM
 	select SND_SOC_CPE
@@ -147,7 +161,7 @@ config SND_SOC_MSM8996
 	select SND_SOC_WCD9330
 	select SND_SOC_WCD9335
 	select SND_SOC_WSA881X
-	select SND_SOC_MSM_HDMI_CODEC_RX
+	select SND_SOC_MSM_HDMI_CODEC_RX if FB_MSM_MDSS_HDMI_PANEL
 	select DTS_SRS_TM
 	select QTI_PP
 	select SND_SOC_CPE
